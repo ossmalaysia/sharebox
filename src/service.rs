@@ -252,13 +252,21 @@ fn unit_quote(value: &str, exec: bool) -> String {
     )
 }
 #[cfg(any(target_os = "linux", test))]
+fn unit_working_directory(value: &str) -> String {
+    // WorkingDirectory is a scalar path: unlike ExecStart/Environment, systemd
+    // neither removes quotes nor unescapes backslashes. Escape specifiers only.
+    // The final /. preserves trailing whitespace and prevents a final backslash
+    // from being interpreted as an INI line continuation.
+    format!("{}/.", value.replace('%', "%%"))
+}
+#[cfg(any(target_os = "linux", test))]
 fn unit(spec: &Spec) -> String {
     let args = std::iter::once(&spec.exe)
         .chain(spec.args.iter())
         .map(|arg| unit_quote(arg, true))
         .collect::<Vec<_>>()
         .join(" ");
-    format!("[Unit]\nDescription=Sharebox {} (trusted LAN)\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironment={}\nExecStart={args}\nRestart=on-failure\nRestartSec=10\nTimeoutStopSec=15\nKillMode=control-group\nStandardOutput=null\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n", spec.role, unit_quote(&spec.cwd, false), unit_quote(&format!("PATH={}", spec.path), false))
+    format!("[Unit]\nDescription=Sharebox {} (trusted LAN)\n\n[Service]\nType=simple\nWorkingDirectory={}\nEnvironment={}\nExecStart={args}\nRestart=on-failure\nRestartSec=10\nTimeoutStopSec=15\nKillMode=control-group\nStandardOutput=null\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n", spec.role, unit_working_directory(&spec.cwd), unit_quote(&format!("PATH={}", spec.path), false))
 }
 #[cfg(target_os = "linux")]
 fn platform(action: &str, role: &str, spec: Option<&Spec>) -> Result<()> {
@@ -390,6 +398,8 @@ mod tests {
         let text = unit(&sample());
         assert!(text.contains("\"/a'&%%$$/worker.json\""));
         assert!(text.contains("Environment=\"PATH=/bin:/node path\""));
+        assert!(text.contains("WorkingDirectory=/a space/.\n"));
+        assert_eq!(unit_working_directory("/a\\b\"c% "), "/a\\b\"c%% /.");
         assert_eq!(unit_quote("a\\b\"c", true), "\"a\\\\b\\\"c\"");
     }
     #[test]
