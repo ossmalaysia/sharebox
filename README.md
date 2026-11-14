@@ -18,7 +18,7 @@ LLM / MCP client ── MCP over HTTP ── Master + dashboard
                                   local Node.js tasks
 ```
 
-One executable provides master and worker modes. The master coordinates jobs; each worker runs only the named tasks its owner configured locally. Task commands and project files remain on the worker machine.
+One executable provides master and worker modes. The master coordinates jobs; each worker runs only the named tasks its owner configured locally. Task commands remain owner-defined on the worker. Source may come from its local checkout or an uploaded immutable snapshot.
 
 ## Install a release
 
@@ -208,6 +208,52 @@ sharebox service install worker --config /absolute/path/to/worker.json
 
 For a master, use `service uninstall master` followed by `service install master --bind 0.0.0.0:7331 --data /absolute/path/to/.sharebox`. Foreground `master` and `worker` commands continue to use the terminal; status icons manage installed services.
 
+## Send source snapshots for tests
+
+Snapshot transfer requires v0.4.0 or later on the uploader, master, and worker. An LLM with local terminal access can run the upload command on the machine containing the project; an MCP connection alone cannot read files from that machine.
+
+Preview the exact selected files before uploading:
+
+```sh
+sharebox snapshot inspect --directory /path/to/project
+sharebox snapshot upload --directory /path/to/project --server http://MASTER_LAN_IP:7331 --token-env SHAREBOX_MCP_TOKEN
+```
+
+`SHAREBOX_MCP_TOKEN` must already contain an MCP token for that master. The CLI reads it from the environment and never accepts a literal token argument. The upload returns a `snapshotId`. The LLM then calls `submit_job` with `workerId`, an owner-enabled task name, and that `snapshotId`. Results identify the snapshot that ran. Reusing the same snapshot ID across workers tests the same initial source bytes even if the uploader's checkout changes afterward.
+
+Ordinary tasks continue to run their local checkout and reject snapshot inputs. To enable a snapshot task, the worker owner edits its local configuration. Use an existing absolute directory dedicated to disposable workspaces for `cwd`; Sharebox creates and cleans a separate job directory beneath it. For **trusted source only**, this native example uses the worker account's permissions:
+
+```json
+{
+  "description": "Test uploaded trusted Node source",
+  "argv": ["node", "--test"],
+  "cwd": "/absolute/path/to/sharebox-workspaces",
+  "timeoutSeconds": 600,
+  "snapshot": { "mode": "native", "prepare": [] }
+}
+```
+
+For Docker isolation, the owner installs Docker, preloads a suitable image, and changes the snapshot setting. Image, command, preparation steps, and networking are owner-controlled; the LLM cannot supply Docker flags or host paths:
+
+```json
+"snapshot": {
+  "mode": "docker",
+  "image": "node:22-bookworm",
+  "network": "none",
+  "prepare": []
+}
+```
+
+Docker images are not pulled automatically. Prefer a pinned image digest for repeatable builds. The container gets a read-only source mount, a 1 GiB temporary work directory, 256 MiB temporary storage, a read-only image filesystem, bounded CPU/memory/PIDs, dropped capabilities, disabled persistent Docker logs, and no inherited host credentials or Docker-socket mount. The image must provide `/bin/sh`, `cp`, and `sleep`; all preparation and test steps share one container. CPU and memory limits also cover the temporary workspace. Docker is required only for Docker-mode tasks. It remains a security-sensitive runtime, not an absolute isolation guarantee.
+
+If a project needs dependencies, the owner can configure a fixed preparation command such as `"prepare": [["npm", "ci", "--ignore-scripts"]]`. Dependencies install inside the job workspace; `node_modules` is never copied from Windows to Mac. Docker networking defaults to `none`; fetching packages needs an explicit owner setting of `"network": "bridge"`. Bridge networking permits normal network access and is not an egress allowlist. Preparation and transfer count toward the job timeout and honor cancellation.
+
+The uploader respects project ignore rules and excludes common credentials, `.git`, `node_modules`, and known caches. Files are staged once, hashed, uploaded in bounded chunks, then verified again by the worker. Symlinks, hard links, special files, unsafe paths, and case collisions are rejected. Version 1 uses ASCII relative filenames, at most 4,096 files, 16 MiB per file, and 128 MiB per snapshot. Exclusions cannot guarantee that source code contains no hardcoded secrets.
+
+Snapshots are private to their uploading MCP principal (the master administrator can manage all snapshots). Workers can download only input assigned to their own active jobs. The master limits snapshot storage to 2 GiB and expires incomplete uploads after 30 minutes. Metadata is also capped at 256 upload/commit receipts, so remove unused snapshots when a quota is reached. Failed container cleanup retains the affected source workspace for investigation; the worker refuses new snapshot work after eight retained entries rather than accumulating them indefinitely. `list_snapshots` lists available input; `delete_snapshot` removes input that no queued or active job needs.
+
+This release transfers immutable snapshots, not a continuously synchronized filesystem. It does not automatically shard tests, synchronize chat sessions, collect arbitrary output artifacts, or provide a dependency cache. Workers still run one job at a time; the LLM can submit separate jobs using the same snapshot to multiple workers.
+
 ## Connect an LLM
 
 In the dashboard, select **Connect MCP**, create a token, choose **Codex** or **Claude Code** and your terminal, then click **Copy command**. Paste into PowerShell or a shell on the computer running the agent. The command includes the endpoint and token. If the agent is on a different computer, open the dashboard using the master’s LAN address so that address is used in the command.
@@ -228,9 +274,9 @@ The LLM can discover available workers and permitted tasks, submit jobs, inspect
 
 ## Execution and network boundaries
 
-- Jobs run natively with the permissions of the worker's OS account. They are not container or VM sandboxes. Use a dedicated account for worker tasks when practical.
+- Local-checkout tasks and native snapshot tasks run with the worker account's permissions and are not sandboxes. Use native snapshot mode only for trusted submitted code. Docker snapshot tasks use the explicitly configured container boundary described above.
 - The worker owner controls command arguments, working directories, and timeouts. The LLM selects a registered task rather than supplying a command to execute.
-- Project source and dependencies must already exist on the selected worker. Automatic source snapshots, peer-to-peer file synchronization, artifact transfer, and test sharding are not implemented in this version.
+- Local-checkout tasks require source and dependencies on the worker. Snapshot tasks transfer verified source into a disposable workspace. Peer-to-peer synchronization, artifact transfer, and automatic test sharding are not implemented.
 - Do not copy `node_modules` between Windows and macOS. Install dependencies locally from the project's lockfile.
 - Browser E2E tasks should use their own application ports and test data. Headful tests require an appropriate logged-in desktop session.
 - This prototype uses plain HTTP on a trusted private network. Tokens, commands, and logs are not encrypted in transit. Do not expose the service to the public Internet or an untrusted/shared network. For use beyond the trusted LAN, add TLS or an authenticated encrypted private-network transport first.

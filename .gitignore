@@ -13,3 +13,7 @@
 /index.html
 
 /node_modules/
+
+# Snapshot workspaces and the documented paired-worker config.
+/.sharebox-snapshots/
+/sharebox-worker.json

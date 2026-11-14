@@ -167,6 +167,35 @@ pub fn client_request(
     token: Option<&str>,
     body: &Value,
 ) -> Result<Value, String> {
+    let data = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let bytes = client_raw(server, path, token, "POST", "application/json", &data)?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+/// Bounded binary transport used for snapshot chunks as well as JSON requests.
+pub fn client_raw(
+    server: &str,
+    path: &str,
+    token: Option<&str>,
+    method: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    if !matches!(method, "GET" | "POST" | "PUT")
+        || !matches!(
+            content_type,
+            "application/json" | "application/octet-stream"
+        )
+        || !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err("Invalid HTTP request parameters".into());
+    }
+    if data.len() > MAX_BODY {
+        return Err("Request exceeds 1 MiB".into());
+    }
     let address = server
         .strip_prefix("http://")
         .ok_or("Local version requires http:// on a trusted LAN")?
@@ -200,7 +229,6 @@ pub fn client_request(
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
-    let data = serde_json::to_vec(body).map_err(|e| e.to_string())?;
     let auth = match token {
         Some(t) => {
             if t.contains('\r') || t.contains('\n') {
@@ -210,18 +238,18 @@ pub fn client_request(
         }
         None => String::new(),
     };
-    let head=format!("POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth}Connection: close\r\n\r\n",data.len());
+    let head=format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{auth}Connection: close\r\n\r\n",data.len());
     stream
         .write_all(head.as_bytes())
-        .and_then(|_| stream.write_all(&data))
+        .and_then(|_| stream.write_all(data))
         .map_err(|e| e.to_string())?;
     let (first, _, bytes) = read_message(&mut DeadlineReader::new(
         &mut stream,
         Duration::from_secs(10),
     ))?;
     let status = first.split_whitespace().nth(1).unwrap_or("500");
-    let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if !status.starts_with('2') {
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         return Err(format!(
             "HTTP {status}: {}",
             value
@@ -230,7 +258,7 @@ pub fn client_request(
                 .unwrap_or("request failed")
         ));
     }
-    Ok(value)
+    Ok(bytes)
 }
 
 #[cfg(test)]

@@ -18,3 +18,5 @@
 .clipboard-fallback{position:fixed;left:0;top:0;width:1px;height:1px;opacity:0}.clipboard-fallback.manual-copy{position:static;width:100%;height:130px;opacity:1;font:11px/1.6 ui-monospace,monospace}dialog summary{cursor:pointer;font-size:12px;margin:18px 0}dialog details p{margin-top:12px}
 
 .network-address-row{display:flex;gap:12px;align-items:center}.network-address-row select{min-width:0;flex:1}#network-status{font-size:12px;line-height:1.7;overflow-wrap:anywhere}#master-network{margin-bottom:24px}#master-network .input-help{margin-bottom:0!important}@media(max-width:700px){#master-network .panel-head{flex-wrap:wrap;gap:12px}.network-address-row{flex-wrap:wrap}.network-address-row select{flex-basis:100%}}
+
+.snapshot-id { overflow-wrap: anywhere; word-break: break-all; }

@@ -6,6 +6,7 @@ Sharebox is one Rust executable with master and worker modes for a trusted priva
 
 ## Implementation standards
 
+- Snapshot tasks execute uploaded code and require explicit worker-owner opt-in. Preserve owner control of execution mode, container image, preparation commands, networking, and workspace root; separate directories are not native security sandboxes.
 - Preserve owner-defined task allowlists. Remote clients must not supply arbitrary commands, working directories, or credentials to execute.
 - Keep network parsing bounded; reject malformed requests and oversized payloads. Keep logs bounded and avoid logging credentials.
 - Persist state before reporting success. Preserve unique job ownership, token revocation, pairing-code expiry, timeout, and cancellation behavior.

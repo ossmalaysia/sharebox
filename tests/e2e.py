@@ -82,7 +82,7 @@ def main():
             init = mcp("initialize", {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}})
             assert init["serverInfo"]["name"] == "sharebox"
             request("/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"}, agent["token"], expected=202)
-            assert len(mcp("tools/list", {})["tools"]) == 6
+            assert {"list_workers", "list_tasks", "submit_job", "get_job", "get_job_logs", "cancel_job"}.issubset({t["name"] for t in mcp("tools/list", {})["tools"]})
             def tool(name, arguments):
                 value = mcp("tools/call", {"name": name, "arguments": arguments})
                 assert not value.get("isError"), value
