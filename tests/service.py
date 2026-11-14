@@ -70,8 +70,9 @@ def main():
 
     # The native registration check below is deliberately separate from the CLI
     # under test: never uninstall an existing user's service during cleanup.
-    if existing_registration(system):
-        return skip("a Sharebox master service already exists; preserving it")
+    has_tray = system in ("Darwin", "Windows")
+    if existing_registration(system) or (has_tray and existing_registration(system, "tray.master")):
+        return skip("a Sharebox master service or tray registration already exists; preserving it")
 
     with tempfile.TemporaryDirectory(prefix="sharebox service test ") as directory:
         data = Path(directory) / "master data"
@@ -101,10 +102,15 @@ def main():
             assert token, "master must persist its token"
             authenticated(token)
             assert existing_registration(system), "install must persist startup registration"
+            if has_tray:
+                assert existing_registration(system, "tray.master"), "install must register the tray"
+                wait_for(lambda: tray_running(system), "companion tray to run")
             service("status", "master")
             service("stop", "master")
             wait_for(lambda: not reachable(), "background master to stop")
             assert existing_registration(system), "stop must preserve startup registration"
+            if has_tray:
+                assert tray_running(system), "stopping the master must leave its tray available"
             assert (data / "admin-token").read_text().strip() == token
             service("start", "master")
             wait_for(reachable, "background master to restart")
@@ -112,6 +118,9 @@ def main():
             service("uninstall", "master")
             wait_for(lambda: not reachable(), "uninstalled master to stop")
             assert not existing_registration(system), "uninstall must remove startup registration"
+            if has_tray:
+                wait_for(lambda: not tray_running(system), "uninstalled tray to stop")
+                assert not existing_registration(system, "tray.master"), "uninstall must remove the tray registration"
             assert (data / "admin-token").read_text().strip() == token
             assert (data / "state.json").is_file(), "uninstall must preserve workspace state"
             attempted = False
@@ -127,15 +136,15 @@ def main():
             if attempted:
                 # Installation may have failed after registering with the OS.
                 result = service("uninstall", "master", check=False)
-                if existing_registration(system) or reachable():
+                if existing_registration(system) or reachable() or (has_tray and existing_registration(system, "tray.master")):
                     raise AssertionError("Service cleanup failed; inspect sharebox service status master: " + result.stderr)
     print("PASS: native master service install, status, stop, start, uninstall; paths with spaces and persisted credentials")
 
 
-def existing_registration(system):
+def existing_registration(system, role="master"):
     if system == "Darwin":
-        definition = Path.home() / "Library/LaunchAgents/org.ossmalaysia.sharebox.master.plist"
-        loaded = command(["launchctl", "print", f"gui/{os.getuid()}/org.ossmalaysia.sharebox.master"])
+        definition = Path.home() / f"Library/LaunchAgents/org.ossmalaysia.sharebox.{role}.plist"
+        loaded = command(["launchctl", "print", f"gui/{os.getuid()}/org.ossmalaysia.sharebox.{role}"])
         return definition.exists() or loaded.returncode == 0
     if system == "Linux":
         config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
@@ -146,13 +155,29 @@ def existing_registration(system):
         return definition.exists() or loaded.stdout.strip() not in ("", "not-found")
     script = (
         "$ErrorActionPreference = 'Stop'; "
-        "$taskName = 'Sharebox-master-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
+        f"$taskName = 'Sharebox-{role.replace('.', '-')}-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
         "$exists = @(Get-ScheduledTask | Where-Object { $_.TaskName -eq $taskName }).Count -gt 0; "
         "Write-Output $exists"
     )
     result = command(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script])
     if result.returncode or result.stdout.strip() not in ("True", "False"):
         raise AssertionError("Cannot safely inspect existing scheduled tasks: " + result.stderr)
+    return result.stdout.strip() == "True"
+
+
+def tray_running(system):
+    if system == "Darwin":
+        result = command(["launchctl", "print", f"gui/{os.getuid()}/org.ossmalaysia.sharebox.tray.master"])
+        return result.returncode == 0 and any(line.strip() == "state = running" for line in result.stdout.splitlines())
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$taskName = 'Sharebox-tray-master-' + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
+        "$task = Get-ScheduledTask | Where-Object { $_.TaskName -eq $taskName }; "
+        "Write-Output ($null -ne $task -and $task.State -eq 'Running')"
+    )
+    result = command(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script])
+    if result.returncode or result.stdout.strip() not in ("True", "False"):
+        raise AssertionError("Cannot inspect companion tray state: " + result.stderr)
     return result.stdout.strip() == "True"
 
 

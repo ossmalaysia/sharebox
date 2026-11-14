@@ -99,6 +99,44 @@ try {
   assert.equal(await page.locator('#page-error').isVisible(), false, 'Workspace API should connect successfully');
   console.log('PASS: dashboard login and empty workspace');
 
+  const networkResponse = await fetch(`${origin}/api/network`, { headers: { Authorization: `Bearer ${admin}` } });
+  assert.equal(networkResponse.status, 200);
+  const realNetwork = await networkResponse.json();
+  assert.equal(realNetwork.localOnly, true, 'The test master really binds only to loopback');
+  assert.deepEqual(realNetwork.urls, []);
+  await page.locator('#network-status').filter({ hasText: 'only from its own machine' }).waitFor();
+  assert.equal(await page.locator('#network-addresses').isVisible(), false);
+  await page.locator('#workers').getByRole('button', { name: '+ Pair worker', exact: true }).click();
+  await page.getByRole('heading', { name: 'Remote pairing needs a LAN address' }).waitFor();
+  assert.equal(await page.locator('#modal .command').count(), 0, 'No unusable remote pairing command should be offered');
+  await page.getByRole('button', { name: 'Pair on this machine only' }).click();
+  await page.getByRole('heading', { name: 'Pair a worker on this machine', exact: true }).waitFor();
+  const localCommands = await page.locator('#modal .command').allTextContents();
+  assert.ok(localCommands.some(command => command.includes(`--server '${origin}'`)));
+  const localCode = localCommands.join(' ').match(/--code\s+'([^']+)'/)?.[1];
+  if (localCode) sensitive.add(localCode);
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
+
+  // Deterministic adapter fixtures test selection without assuming the CI host has a LAN.
+  // The real master remains loopback-only; these are UI fixtures, not reachability tests.
+  let discoveredUrls = ['http://10.20.30.40:7331', 'http://192.168.50.10:7331'];
+  await page.route('**/api/network', route => route.fulfill({ json: { bindAddress: '0.0.0.0:7331', localOnly: false, urls: discoveredUrls } }));
+  await page.getByRole('button', { name: 'Refresh addresses' }).click();
+  await page.getByLabel('Master LAN address').selectOption(discoveredUrls[1]);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async text => { window.copiedLanUrl = text; } } });
+  });
+  await page.getByRole('button', { name: 'Copy URL', exact: true }).click();
+  assert.equal(await page.evaluate(() => window.copiedLanUrl), discoveredUrls[1]);
+  await page.getByRole('button', { name: 'Refresh addresses' }).click();
+  assert.equal(await page.getByLabel('Master LAN address').inputValue(), discoveredUrls[1], 'Refresh preserves a still valid selection');
+  discoveredUrls = ['http://192.168.50.20:7331'];
+  await page.getByRole('button', { name: 'Refresh addresses' }).click();
+  await until(async () => await page.getByLabel('Master LAN address').inputValue() === discoveredUrls[0], 'changed adapter address');
+  const lanUrl = discoveredUrls[0];
+  console.log('PASS: loopback guidance, explicit same-machine pairing, LAN selection, copy and refreshed addresses');
+
+
   await page.locator('#workers').getByRole('button', { name: '+ Pair worker', exact: true }).click();
   await page.getByRole('heading', { name: 'Bring another machine online' }).waitFor();
   const commands = await page.locator('#modal .command').allTextContents();
@@ -106,7 +144,8 @@ try {
   assert.ok(pairingCommand, 'Pairing dialog should display a worker command');
   const code = pairingCommand.match(/--code\s+'([^']+)'/)?.[1];
   assert.ok(code, 'Worker command should contain a one-time pairing code');
-  assert.ok(pairingCommand.includes(origin), 'Pairing command must point to this master');
+  assert.ok(pairingCommand.includes(lanUrl), 'Remote pairing command must use the selected LAN address even when the dashboard is localhost');
+  assert.ok(!pairingCommand.includes(origin), 'Do not advertise loopback to a remote worker');
   sensitive.add(code);
   await page.getByRole('button', { name: 'Done', exact: true }).click();
 
@@ -142,6 +181,9 @@ try {
 
   await page.getByRole('button', { name: 'Connect MCP ↗', exact: true }).click();
   await page.getByLabel('Connection name').fill('UI smoke agent');
+  assert.equal(await page.getByLabel('Master address for this agent').inputValue(), origin, 'MCP defaults to the dashboard address');
+  await page.getByLabel('Master address for this agent').selectOption(lanUrl);
+  const configuredMcpUrl = `${lanUrl}/mcp`;
   await page.getByRole('button', { name: 'Create MCP token' }).click();
   await page.getByRole('heading', { name: 'Your agent’s connection is ready' }).waitFor();
   await page.locator('#modal summary').click();
@@ -149,14 +191,14 @@ try {
   sensitive.add(token);
   assert.ok(token.length >= 32, 'MCP token should contain sufficient random material');
   const clientConfig = JSON.parse(await page.locator('#mcp-config').innerText());
-  assert.equal(clientConfig.mcpServers.sharebox.url, `${origin}/mcp`);
+  assert.equal(clientConfig.mcpServers.sharebox.url, configuredMcpUrl);
   assert.equal(clientConfig.mcpServers.sharebox.headers.Authorization, `Bearer ${token}`);
   assert.equal(clientConfig.mcpServers.sharebox.type, 'http');
   await page.getByLabel('Client and terminal').selectOption('codex-powershell');
   const windowsSetup = await page.locator('#mcp-setup').innerText();
   assert.ok(windowsSetup.includes(`[Environment]::SetEnvironmentVariable('SHAREBOX_MCP_TOKEN', '${token}', 'User')`));
   assert.ok(windowsSetup.includes(`$env:SHAREBOX_MCP_TOKEN = '${token}'`));
-  assert.ok(windowsSetup.includes(`codex mcp add sharebox --url '${origin}/mcp' --bearer-token-env-var SHAREBOX_MCP_TOKEN`));
+  assert.ok(windowsSetup.includes(`codex mcp add sharebox --url '${configuredMcpUrl}' --bearer-token-env-var SHAREBOX_MCP_TOKEN`));
   await page.getByLabel('Client and terminal').selectOption('codex-shell');
   const shellSetup = await page.locator('#mcp-setup').innerText();
   assert.ok(shellSetup.startsWith(`export SHAREBOX_MCP_TOKEN='${token}'\n`));
@@ -178,9 +220,9 @@ try {
   await page.locator('#copy-setup').click();
   assert.equal(await page.locator('.clipboard-fallback.manual-copy').inputValue(), shellSetup);
   await page.getByLabel('Client and terminal').selectOption('claude-powershell');
-  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${origin}/mcp' --header 'Authorization: Bearer ${token}'`);
+  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${configuredMcpUrl}' --header 'Authorization: Bearer ${token}'`);
   await page.getByLabel('Client and terminal').selectOption('claude-shell');
-  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${origin}/mcp' --header 'Authorization: Bearer ${token}'`);
+  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${configuredMcpUrl}' --header 'Authorization: Bearer ${token}'`);
   await page.getByLabel('Client and terminal').selectOption('json');
   assert.deepEqual(JSON.parse(await page.locator('#mcp-setup').innerText()), clientConfig);
 

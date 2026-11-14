@@ -5,7 +5,7 @@ use std::process::Command;
 
 type Result<T> = std::result::Result<T, String>;
 
-pub const HELP: &str = "sharebox service install master [--bind 0.0.0.0:7331] [--data .sharebox]\nsharebox service install worker [--config worker.json]\nsharebox service start|stop|status|uninstall master|worker\n\nInstall starts immediately and enables startup at user login. Keep the executable at its installed path.\nWindows uses a user Scheduled Task, macOS a LaunchAgent, Linux a systemd user unit.\nPair a worker in the foreground first. Stop foreground instances before installing.\nUninstall preserves data and worker credentials. Stop/cancel active jobs before stopping a worker.";
+pub const HELP: &str = "sharebox service install master [--bind 0.0.0.0:7331] [--data .sharebox]\nsharebox service install worker [--config worker.json]\nsharebox service start|stop|status|uninstall master|worker\n\nInstall starts immediately and enables startup at user login. Keep the executable at its installed path.\nWindows uses user Scheduled Tasks, macOS LaunchAgents, Linux a systemd user unit.\nWindows/macOS also start a tray icon for each installed role; closing the icon leaves the service running.\nPair a worker in the foreground first. Stop foreground instances before installing.\nUninstall preserves data and worker credentials. Stop/cancel active jobs before stopping a worker.";
 
 #[derive(Debug)]
 struct Spec {
@@ -14,6 +14,7 @@ struct Spec {
     args: Vec<String>,
     cwd: String,
     path: String,
+    dashboard: String,
 }
 
 fn safe(value: &str) -> Result<&str> {
@@ -61,13 +62,26 @@ fn spec(role: &str, opts: &HashMap<String, String>) -> Result<Spec> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut args = vec![role.into()];
+    let dashboard;
     if role == "master" {
         let bind = opts
             .get("--bind")
             .map(String::as_str)
             .unwrap_or("0.0.0.0:7331");
-        bind.parse::<std::net::SocketAddr>()
+        let mut address = bind
+            .parse::<std::net::SocketAddr>()
             .map_err(|_| "--bind must be an IP address and port, e.g. 0.0.0.0:7331")?;
+        if address.port() == 0 {
+            return Err("Service --bind must use a fixed, nonzero port".into());
+        }
+        if address.ip().is_unspecified() {
+            address.set_ip(if address.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        dashboard = format!("http://{address}");
         let data = PathBuf::from(
             opts.get("--data")
                 .map(String::as_str)
@@ -108,8 +122,11 @@ fn spec(role: &str, opts: &HashMap<String, String>) -> Result<Spec> {
         if config_value.token.is_empty() || config_value.worker_id.is_empty() {
             return Err("Pair this worker in the foreground before installing its service".into());
         }
+        dashboard = config_value.server.trim_end_matches('/').to_owned();
         args.extend(["--config".into(), path_text(&config)?]);
     }
+    #[cfg(any(windows, target_os = "macos"))]
+    crate::tray::validate_dashboard(&dashboard)?;
     let path = std::env::var("PATH").map_err(|_| "PATH must be set and valid Unicode")?;
     safe(&path)?;
     Ok(Spec {
@@ -118,6 +135,7 @@ fn spec(role: &str, opts: &HashMap<String, String>) -> Result<Spec> {
         args,
         cwd: path_text(&cwd)?,
         path,
+        dashboard,
     })
 }
 
@@ -132,24 +150,247 @@ pub fn run(args: Vec<String>) -> Result<()> {
     } else {
         None
     };
-    platform(&action, &role, spec.as_ref())?;
     if action == "install" {
+        install(spec.as_ref().ok_or("Missing service specification")?)?;
+    } else {
+        service_action(&action, &role)?;
+    }
+    if action == "install" {
+        println!("Dashboard: {}", spec.as_ref().unwrap().dashboard);
         println!("Registered {role} for startup at user login and requested start. Run `sharebox service status {role}` to check its state.");
     }
     Ok(())
 }
 
-fn command(program: &str, args: &[&str]) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .status()
-        .map_err(|e| format!("Run {program}: {e}"))?;
-    if status.success() {
+fn valid_role(role: &str) -> Result<()> {
+    if matches!(role, "master" | "worker") {
         Ok(())
     } else {
+        Err("Service role must be master or worker".into())
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn companion(spec: &Spec) -> Spec {
+    Spec {
+        role: format!("tray.{}", spec.role),
+        exe: spec.exe.clone(),
+        args: vec![
+            "tray".into(),
+            "--role".into(),
+            spec.role.clone(),
+            "--dashboard".into(),
+            spec.dashboard.clone(),
+        ],
+        cwd: spec.cwd.clone(),
+        path: spec.path.clone(),
+        dashboard: spec.dashboard.clone(),
+    }
+}
+
+fn install(spec: &Spec) -> Result<()> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let tray = companion(spec);
+        if registered(&spec.role)? || registered(&tray.role)? {
+            return Err("A service or tray registration already exists. Uninstall this role before installing again; data and worker credentials are preserved.".into());
+        }
+        platform("install", &spec.role, Some(spec))?;
+        if let Err(error) = platform("install", &tray.role, Some(&tray)) {
+            let rollback = platform("uninstall", &spec.role, None);
+            return Err(format!(
+                "Tray registration failed: {error}. Background service rollback: {}",
+                rollback.err().unwrap_or_else(|| "completed".into())
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    platform("install", &spec.role, Some(spec))
+}
+
+/// Called off the UI thread. Starting a role also restores its companion icon;
+/// stopping keeps the icon available so the owner can start the role again.
+pub fn service_action(action: &str, role: &str) -> Result<()> {
+    valid_role(role)?;
+    if !matches!(action, "start" | "stop" | "status" | "uninstall") {
+        return Err("Unsupported service action".into());
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let tray = format!("tray.{role}");
+        if action == "uninstall" && registered(&tray)? {
+            platform("uninstall", &tray, None)?;
+        }
+        // launchctl bootstrap/bootout are not themselves idempotent.
+        if (action != "start" || !is_running(role)?) && (action != "stop" || loaded(role)?) {
+            platform(action, role, None)?;
+        }
+        if action == "start" && registered(&tray)? && !running_native(&tray)? {
+            platform("start", &tray, None)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    platform(action, role, None)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn bounded_output(program: &str, args: &[&str]) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().map_err(|e| format!("Run {program}: {e}"))?;
+    let stdout = child.stdout.take().ok_or("Missing service stdout")?;
+    let stderr = child.stderr.take().ok_or("Missing service stderr")?;
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.take(16384).read_to_end(&mut bytes);
+        bytes
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(16384).read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(std::process::Output {
+                status,
+                stdout: out.join().unwrap_or_default(),
+                stderr: err.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{program} timed out after 15 seconds"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_loaded(role: &str) -> Result<Option<String>> {
+    let target = format!("gui/{}/org.ossmalaysia.sharebox.{role}", unsafe {
+        libc::geteuid()
+    });
+    let output = bounded_output("launchctl", &["print", &target])?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    if matches!(output.status.code(), Some(113) | Some(3)) {
+        return Ok(None);
+    }
+    Err(format!(
+        "Cannot inspect service: {}",
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+#[cfg(target_os = "macos")]
+fn registered(role: &str) -> Result<bool> {
+    Ok(home()?
+        .join("Library/LaunchAgents")
+        .join(format!("org.ossmalaysia.sharebox.{role}.plist"))
+        .exists()
+        || mac_loaded(role)?.is_some())
+}
+#[cfg(target_os = "macos")]
+fn loaded(role: &str) -> Result<bool> {
+    Ok(mac_loaded(role)?.is_some())
+}
+
+#[cfg(windows)]
+fn task_state(role: &str) -> Result<String> {
+    let script = format!("$ErrorActionPreference = 'Stop'; $name = {} + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $task = Get-ScheduledTask | Where-Object {{ $_.TaskName -eq $name }}; if ($null -eq $task) {{ Write-Output 'Missing' }} else {{ Write-Output $task.State }}", ps(&format!("Sharebox-{}-", role.replace('.', "-"))));
+    let output = bounded_output(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "Cannot inspect scheduled task: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+}
+#[cfg(windows)]
+fn registered(role: &str) -> Result<bool> {
+    Ok(task_state(role)? != "Missing")
+}
+#[cfg(windows)]
+fn loaded(role: &str) -> Result<bool> {
+    Ok(task_state(role)? == "Running")
+}
+
+/// Whether the OS service manager reports this role's process as running.
+#[cfg(any(windows, target_os = "macos"))]
+pub fn is_running(role: &str) -> Result<bool> {
+    valid_role(role)?;
+    running_native(role)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn running_native(role: &str) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(mac_loaded(role)?
+            .is_some_and(|text| text.lines().any(|line| line.trim() == "state = running")))
+    }
+    #[cfg(windows)]
+    {
+        Ok(task_state(role)? == "Running")
+    }
+}
+
+fn command(program: &str, args: &[&str]) -> Result<()> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let output = bounded_output(program, args)?;
+        if output.status.success() {
+            if args.contains(&"print") || args.iter().any(|arg| arg.contains("Select-Object")) {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
+            return Ok(());
+        }
         Err(format!(
-            "{program} failed ({status}); inspect the service manager's output above"
+            "{program} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let status = Command::new(program)
+            .args(args)
+            .status()
+            .map_err(|e| format!("Run {program}: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{program} failed ({status}); inspect the service manager's output above"
+            ))
+        }
     }
 }
 
@@ -179,9 +420,15 @@ fn write_new(path: &Path, contents: &str) -> Result<()> {
                 path.display()
             )
         })?;
-    file.write_all(contents.as_bytes())
+    if let Err(error) = file
+        .write_all(contents.as_bytes())
         .and_then(|_| file.sync_all())
-        .map_err(|e| e.to_string())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -199,7 +446,12 @@ fn plist(spec: &Spec) -> String {
         .chain(spec.args.iter())
         .map(|arg| format!("<string>{}</string>", xml(arg)))
         .collect::<String>();
-    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>org.ossmalaysia.sharebox.{}</string>\n<key>ProgramArguments</key><array>{args}</array>\n<key>WorkingDirectory</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>/dev/null</string>\n<key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n", spec.role, xml(&spec.cwd), xml(&spec.path))
+    let keep_alive = if spec.role.starts_with("tray.") {
+        "false"
+    } else {
+        "true"
+    };
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>org.ossmalaysia.sharebox.{}</string>\n<key>ProgramArguments</key><array>{args}</array>\n<key>WorkingDirectory</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><{keep_alive}/>\n<key>ThrottleInterval</key><integer>10</integer>\n<key>StandardOutPath</key><string>/dev/null</string>\n<key>StandardErrorPath</key><string>/dev/null</string>\n</dict></plist>\n", spec.role, xml(&spec.cwd), xml(&spec.path))
 }
 
 #[cfg(target_os = "macos")]
@@ -214,20 +466,23 @@ fn platform(action: &str, role: &str, spec: Option<&Spec>) -> Result<()> {
     match action {
         "install" => {
             write_new(&file, &plist(spec.ok_or("Missing service specification")?))?;
-            command("launchctl", &["bootstrap", &domain, &file_text])
+            if let Err(error) = command("launchctl", &["bootstrap", &domain, &file_text]) {
+                let _ = std::fs::remove_file(&file);
+                return Err(error);
+            }
+            Ok(())
         }
-        "start" => command("launchctl", &["bootstrap", &domain, &file_text]),
+        "start" => {
+            if loaded(role)? {
+                command("launchctl", &["kickstart", &target])
+            } else {
+                command("launchctl", &["bootstrap", &domain, &file_text])
+            }
+        }
         "stop" => command("launchctl", &["bootout", &target]),
         "status" => command("launchctl", &["print", &target]),
         "uninstall" => {
-            // A stopped service is already booted out; only boot it out when loaded.
-            let loaded = Command::new("launchctl")
-                .args(["print", &target])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map_err(|e| e.to_string())?;
-            if loaded.success() {
+            if loaded(role)? {
                 command("launchctl", &["bootout", &target])?;
             }
             std::fs::remove_file(&file).map_err(|e| format!("Remove {}: {e}", file.display()))
@@ -322,7 +577,8 @@ fn windows_arg(value: &str) -> String {
 }
 #[cfg(any(windows, test))]
 fn windows_script(action: &str, role: &str, spec: Option<&Spec>) -> Result<String> {
-    let mut script = format!("$ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $taskName = 'Sharebox-{role}-' + $identity.User.Value; ");
+    let task_role = role.replace('.', "-");
+    let mut script = format!("$ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $taskName = 'Sharebox-{task_role}-' + $identity.User.Value; ");
     match action {
         "install" => {
             let spec = spec.ok_or("Missing service specification")?;
@@ -330,7 +586,7 @@ fn windows_script(action: &str, role: &str, spec: Option<&Spec>) -> Result<Strin
             // No persistent output files or secrets in the scheduled task definition.
             let invocation = format!("$env:PATH = {}; & {} {} *> $null; exit $LASTEXITCODE", ps(&spec.path), ps(&spec.exe), spec.args.iter().map(|a| ps(a)).collect::<Vec<_>>().join(" "));
             let host_args = format!("-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command {}", windows_arg(&invocation));
-            script.push_str(&format!("$action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument {} -WorkingDirectory {}; $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name; $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited; $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName $taskName -Description {} -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null; Start-ScheduledTask -TaskName $taskName;", ps(&host_args), ps(&spec.cwd), ps(&format!("Sharebox {}: starts at user login", spec.role))));
+            script.push_str(&format!("$action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument {} -WorkingDirectory {}; $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name; $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited; $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; $registered = $false; try {{ Register-ScheduledTask -TaskName $taskName -Description {} -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null; $registered = $true; Start-ScheduledTask -TaskName $taskName; }} catch {{ if ($registered) {{ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue; }} throw; }}", ps(&host_args), ps(&spec.cwd), ps(&format!("Sharebox {}: starts at user login", spec.role))));
         }
         "start" => script.push_str("Start-ScheduledTask -TaskName $taskName;"),
         "stop" => script.push_str("Stop-ScheduledTask -TaskName $taskName;"),
@@ -372,6 +628,7 @@ mod tests {
             ],
             cwd: "/a space".into(),
             path: "/bin:/node path".into(),
+            dashboard: "http://127.0.0.1:7331".into(),
         }
     }
     #[test]
@@ -392,6 +649,33 @@ mod tests {
         assert!(text.contains("/a&apos;&amp;%$/worker.json"));
         assert!(text.contains("<key>PATH</key><string>/bin:/node path</string>"));
         assert!(text.contains("/dev/null"));
+    }
+    #[test]
+    fn companions_start_the_same_role_without_worker_credentials() {
+        for role in ["master", "worker"] {
+            let mut source = sample();
+            source.role = role.into();
+            let tray = companion(&source);
+            assert_eq!(tray.role, format!("tray.{role}"));
+            assert_eq!(
+                tray.args,
+                [
+                    "tray",
+                    "--role",
+                    role,
+                    "--dashboard",
+                    "http://127.0.0.1:7331"
+                ]
+            );
+            assert!(!tray.args.iter().any(|arg| arg.contains("worker.json")));
+            let mac = plist(&tray);
+            assert!(mac.contains("<key>KeepAlive</key><false/>"));
+            assert!(mac.contains(&format!("org.ossmalaysia.sharebox.tray.{role}")));
+            let windows = windows_script("install", &tray.role, Some(&tray)).unwrap();
+            assert!(windows.contains(&format!("'Sharebox-tray-{role}-'")));
+            assert!(windows.contains("$registered = $true"));
+            assert!(windows.contains("if ($registered)"));
+        }
     }
     #[test]
     fn systemd_disables_specifier_and_variable_expansion() {

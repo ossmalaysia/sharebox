@@ -50,6 +50,11 @@ def main():
             request("/api/me", expected=401)
             request("/api/me", token=admin, headers={"Origin": "http://evil.example"}, expected=403)
             assert request("/api/me", token=admin)["name"] == "Local workspace"
+            request("/api/network", expected=401)
+            request("/api/network", token=admin, headers={"Origin": "http://evil.example"}, expected=403)
+            network = request("/api/network", token=admin)
+            assert network["localOnly"] is True and network["urls"] == [], network
+            assert network["bindAddress"] == f"127.0.0.1:{port}", network
             pair = request("/api/pairing", {}, admin, expected=201)
             cfg = root / "worker.json"
             config = {"name": "Integration worker", "server": origin, "tasks": {
@@ -68,6 +73,7 @@ def main():
             request("/api/worker/pair", {"code": pair["code"], "tasks": [{"name": "pass"}]}, expected=401)
             agent = request("/api/tokens", {"name": "Integration MCP"}, admin, expected=201)
             request("/api/pairing", {}, agent["token"], expected=403)
+            request("/api/network", token=agent["token"], expected=403)
             counter = 0
             def mcp(method, params):
                 nonlocal counter
