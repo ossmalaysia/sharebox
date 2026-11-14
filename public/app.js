@@ -11,6 +11,8 @@ let refreshing = false;
 let toastTimer;
 let selectedJobId = null;
 let modalKind = '';
+let network = { bindAddress: '', localOnly: false, urls: [] };
+let selectedLanUrl = '';
 
 function setToken(value) {
   adminToken = value;
@@ -49,7 +51,7 @@ async function api(path, options = {}) {
 }
 
 function disconnect(message = '') {
-  clearInterval(refreshTimer); setToken(''); selectedJobId = null; closeModal();
+  clearInterval(refreshTimer); setToken(''); selectedJobId = null; selectedLanUrl = ''; network = { bindAddress: '', localOnly: false, urls: [] }; closeModal();
   $('#loading').classList.add('hidden'); $('#app').classList.add('hidden'); $('#login').classList.remove('hidden');
   $('#admin-token').value = ''; showError($('#login-error'), message);
 }
@@ -58,7 +60,32 @@ async function connect() {
   $('#workspace-name').textContent = me.name || 'Local workspace'; $('#master-host').textContent = location.host;
   $('#mcp-endpoint').textContent = `${location.origin}/mcp`;
   $('#loading').classList.add('hidden'); $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
-  await refresh(); clearInterval(refreshTimer); refreshTimer = setInterval(refresh, 4000);
+  await Promise.all([refresh(), refreshNetwork()]); clearInterval(refreshTimer); refreshTimer = setInterval(refresh, 4000);
+}
+
+function renderNetwork() {
+  const urls = network.localOnly ? [] : network.urls;
+  if (!urls.includes(selectedLanUrl)) selectedLanUrl = urls[0] || '';
+  $('#network-addresses').classList.toggle('hidden', !urls.length);
+  $('#lan-address').innerHTML = urls.map(url => `<option value="${escapeHTML(url)}" ${url === selectedLanUrl ? 'selected' : ''}>${escapeHTML(url)}</option>`).join('');
+  $('#copy-lan-address').disabled = !selectedLanUrl;
+  $('#network-bind').textContent = network.bindAddress ? `Listening on ${network.bindAddress}` : '';
+  $('#network-status').textContent = network.error || (network.localOnly
+    ? 'This master accepts connections only from its own machine. To connect a remote worker, restart it with --bind 0.0.0.0:7331 (or your chosen port), keeping the same data directory. Allow Sharebox on private networks only.'
+    : urls.length ? `${urls.length} LAN address${urls.length === 1 ? '' : 'es'} detected. Use the selected address when pairing another machine.`
+      : 'No private LAN address was detected. Connect the master to your trusted network, then refresh addresses. Remote pairing is unavailable until a LAN address is found.');
+}
+async function refreshNetwork() {
+  const button = $('#refresh-network'); button.disabled = true;
+  try {
+    const result = await api('/api/network');
+    // Keep selectable addresses bounded, and never treat wildcard or loopback URLs as LAN URLs.
+    const urls = (Array.isArray(result.urls) ? result.urls : []).slice(0, 64).filter(value => {
+      try { if (typeof value !== 'string') return false; const url = new URL(value); return url.protocol === 'http:' && !url.username && !url.password && !['localhost', '0.0.0.0', '[::]', '[::1]'].includes(url.hostname) && !url.hostname.startsWith('127.'); } catch { return false; }
+    });
+    network = { bindAddress: result.bindAddress || '', localOnly: result.localOnly === true, urls, error: result.error || '' };
+  } catch (error) { network = { bindAddress: '', localOnly: false, urls: [], error: `Unable to read network addresses: ${error.message}` }; }
+  finally { renderNetwork(); button.disabled = false; }
 }
 
 async function refresh() {
@@ -129,14 +156,22 @@ async function copy(text) {
   }
 }
 
-async function pairing() {
+async function pairing(sameMachine = false) {
   openModal(`<h2 id="modal-title">Pair a worker</h2><p>Creating a one-time pairing code for this workspace…</p>${errorBox()}`, 'pair');
   try {
+    await refreshNetwork();
+    if (modalKind !== 'pair') return;
+    if (!sameMachine && !selectedLanUrl) {
+      openModal(`<h2 id="modal-title">Remote pairing needs a LAN address</h2><p>${escapeHTML($('#network-status').textContent)}</p><p>You can still pair a worker on the master’s own machine using this dashboard address.</p><div class="actions"><button class="btn" data-action="close">Close</button><button class="btn primary" id="pair-same-machine">Pair on this machine only</button></div>`, 'pair');
+      $('#pair-same-machine').onclick = () => pairing(true);
+      return;
+    }
+    const serverUrl = sameMachine ? location.origin : selectedLanUrl;
     const result = await api('/api/pairing', { method: 'POST', body: {} });
     if (modalKind !== 'pair') return;
     const init = './sharebox init --config worker.json';
-    const command = `./sharebox worker --server ${shellQuote(location.origin)} --code ${shellQuote(result.code)} --config worker.json`;
-    openModal(`<h2 id="modal-title">Bring another machine online</h2><p>Run the Sharebox binary on the target machine. Its configuration defines exactly which tasks your agent may execute.</p><div class="alert warning">Pairing code expires ${escapeHTML(new Date(numericTime(result.expiresAt)).toLocaleTimeString())}. Use it once and keep it private.</div><div class="command-label"><strong>1. Create a worker configuration</strong><button class="text-btn" id="copy-init">Copy</button></div><pre class="command">${escapeHTML(init)}</pre><p>Edit <code>worker.json</code> to select local directories and allowed tasks.</p><div class="command-label"><strong>2. Pair and start the worker</strong><button class="text-btn" id="copy-pair">Copy</button></div><pre class="command">${escapeHTML(command)}</pre><p>On Windows, use <code>.\\sharebox.exe</code> in PowerShell. The target machine must be able to reach <strong>${escapeHTML(location.origin)}</strong>. If this address is localhost, open this dashboard through the master’s LAN IP before pairing another computer.</p><div class="alert success">The worker will appear in your dashboard after it connects. Keep its terminal running.</div>${errorBox()}<div class="actions"><button class="btn" data-action="close">Done</button></div>`, 'pair');
+    const command = `./sharebox worker --server ${shellQuote(serverUrl)} --code ${shellQuote(result.code)} --config worker.json`;
+    openModal(`<h2 id="modal-title">${sameMachine ? 'Pair a worker on this machine' : 'Bring another machine online'}</h2><p>Run the Sharebox binary on the target machine. Its configuration defines exactly which tasks your agent may execute.</p><div class="alert warning">Pairing code expires ${escapeHTML(new Date(numericTime(result.expiresAt)).toLocaleTimeString())}. Use it once and keep it private.</div><div class="command-label"><strong>1. Create a worker configuration</strong><button class="text-btn" id="copy-init">Copy</button></div><pre class="command">${escapeHTML(init)}</pre><p>Edit <code>worker.json</code> to select local directories and allowed tasks.</p><div class="command-label"><strong>2. Pair and start the worker</strong><button class="text-btn" id="copy-pair">Copy</button></div><pre class="command">${escapeHTML(command)}</pre><p>On Windows, use <code>.\\sharebox.exe</code> in PowerShell. The target machine must be able to reach <strong>${escapeHTML(serverUrl)}</strong>. ${sameMachine ? 'This command is for a worker on the same machine as the master.' : 'Open this URL from the worker first to check access; address detection does not verify firewall or network reachability.'}</p><div class="alert success">The worker will appear in your dashboard after it connects. Keep its terminal running.</div>${errorBox()}<div class="actions"><button class="btn" data-action="close">Done</button></div>`, 'pair');
     $('#copy-init').onclick = () => copy(init); $('#copy-pair').onclick = () => copy(command);
   } catch (error) { modalError(error); }
 }
@@ -152,14 +187,14 @@ function delegate(workerId) {
 }
 
 function connectMcp() {
-  openModal(`<h2 id="modal-title">Connect your LLM agent</h2><p>Create a dedicated bearer token for a client that supports Streamable HTTP MCP with authorization headers.</p><form id="token-form"><label for="token-name">Connection name</label><input id="token-name" required maxlength="80" placeholder="Windows coding agent" autocomplete="off">${errorBox()}<div class="actions"><button class="btn" type="button" data-action="close">Cancel</button><button class="btn primary" type="submit">Create MCP token →</button></div></form><p class="input-help">Your client must be able to reach this local master. A cloud-hosted LLM client cannot directly reach a private LAN address.</p>`, 'token');
+  openModal(`<h2 id="modal-title">Connect your LLM agent</h2><p>Create a dedicated bearer token for a client that supports Streamable HTTP MCP with authorization headers.</p><form id="token-form"><label for="token-name">Connection name</label><input id="token-name" required maxlength="80" placeholder="Windows coding agent" autocomplete="off"><label for="mcp-address">Master address for this agent</label><select id="mcp-address"><option value="${escapeHTML(location.origin)}">Dashboard address · ${escapeHTML(location.origin)}</option>${selectedLanUrl && selectedLanUrl !== location.origin ? `<option value="${escapeHTML(selectedLanUrl)}">Selected LAN address · ${escapeHTML(selectedLanUrl)}</option>` : ''}</select><p class="input-help">For an agent on another computer, choose the selected LAN address. A localhost address works only on the master’s own machine.</p>${errorBox()}<div class="actions"><button class="btn" type="button" data-action="close">Cancel</button><button class="btn primary" type="submit">Create MCP token →</button></div></form><p class="input-help">Your client must be able to reach this local master. A cloud-hosted LLM client cannot directly reach a private LAN address.</p>`, 'token');
   $('#token-form').onsubmit = async event => {
     event.preventDefault(); const button = $('#token-form button[type="submit"]'); button.disabled = true;
     try {
       const name = $('#token-name').value.trim(); if (!name) throw new Error('Enter a connection name.');
+      const endpoint = `${$('#mcp-address').value}/mcp`;
       const result = await api('/api/tokens', { method: 'POST', body: { name } });
       if (modalKind !== 'token') return;
-      const endpoint = `${location.origin}/mcp`;
       const config = JSON.stringify({ mcpServers: { sharebox: { type: 'http', url: endpoint, headers: { Authorization: `Bearer ${result.token}` } } } }, null, 2);
       openModal(`<h2 id="modal-title">Your agent’s connection is ready</h2><p>Copy the setup command into a terminal on the machine running your agent. Your address and token are already filled in.</p><label for="mcp-client">Client and terminal</label><select id="mcp-client"><option value="codex-powershell">Codex · Windows PowerShell</option><option value="codex-shell">Codex · macOS / Linux (bash or zsh)</option><option value="claude-powershell">Claude Code · Windows PowerShell</option><option value="claude-shell">Claude Code · macOS / Linux</option><option value="json">Other client · JSON configuration</option></select><div class="command-label"><strong id="setup-label">Setup command</strong><button class="text-btn" id="copy-setup">Copy command</button></div><pre class="command" id="mcp-setup" tabindex="0"></pre><p class="input-help" id="setup-help"></p><p class="input-help">If your agent runs on another machine, use the master’s LAN IP instead of localhost. These commands contain a private token; do not commit or share them publicly.</p><details><summary>Token and JSON configuration</summary><p>Save this token now. It is shown only once.</p><div class="command-label"><strong>Bearer token</strong><button class="text-btn" id="copy-token">Copy token</button></div><div class="secret">${escapeHTML(result.token)}</div><div class="command-label"><strong>Example client configuration</strong><button class="text-btn" id="copy-config">Copy config</button></div><pre class="command" id="mcp-config">${escapeHTML(config)}</pre></details><p>The agent can discover workers, submit allowed tasks, inspect jobs and logs, and cancel jobs. Revoke this token from MCP connections to remove its access.</p><div class="actions"><button class="btn primary" data-action="close">I’ve saved the token</button></div>`, 'token-created');
       const select = $('#mcp-client');
@@ -240,6 +275,9 @@ $('#modal').addEventListener('close', () => {
 });
 $('#modal').addEventListener('click', event => { if (event.target !== $('#modal')) return; const r = $('#modal').getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) closeModal(); });
 $('#job-filter').onchange = renderJobs;
+$('#refresh-network').onclick = () => refreshNetwork();
+$('#lan-address').onchange = () => { selectedLanUrl = $('#lan-address').value; };
+$('#copy-lan-address').onclick = () => { if (selectedLanUrl) void copy(selectedLanUrl); };
 $('#copy-endpoint').onclick = () => copy(`${location.origin}/mcp`);
 $$('nav a').forEach(a => a.onclick = () => { $$('nav a').forEach(n => n.classList.remove('active')); a.classList.add('active'); $('#breadcrumb').textContent = a.textContent.trim().replace(/^[^A-Za-z]+/, ''); });
 if (adminToken) connect().catch(error => disconnect(error.message)); else disconnect();

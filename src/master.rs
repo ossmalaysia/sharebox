@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::{
     fs,
     io::Write,
-    net::{IpAddr, TcpListener},
+    net::{IpAddr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -41,6 +41,7 @@ struct Store {
     state: State,
     path: PathBuf,
     admin: String,
+    bound_addr: SocketAddr,
 }
 fn private_write(path: &Path, data: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
@@ -513,6 +514,9 @@ fn handle(store: &mut Store, req: &Request) -> Response {
         return Response::error(403, "Admin token required");
     }
     match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/network") => {
+            Response::json(200, json!(crate::network::snapshot(store.bound_addr)))
+        }
         ("GET", "/api/me") => Response::json(200, json!({"name":"Local workspace"})),
         ("GET", "/api/workspace") => Response::json(
             200,
@@ -642,14 +646,16 @@ pub fn run(bind: &str, dir: PathBuf) -> Result<(), String> {
     } else {
         State::default()
     };
+    let listener = TcpListener::bind(bind).map_err(|e| e.to_string())?;
+    let bound_addr = listener.local_addr().map_err(|e| e.to_string())?;
     let store = Arc::new(Mutex::new(Store {
         state,
         path,
         admin: admin.clone(),
+        bound_addr,
     }));
     store.lock().unwrap().save()?;
-    let listener = TcpListener::bind(bind).map_err(|e| e.to_string())?;
-    println!("Sharebox master listening on http://{}\nDashboard: http://localhost:{}\nAdmin token: {admin}\nSaved at {}\nTrusted private LAN only: HTTP is unencrypted. Native tasks use worker account permissions.",listener.local_addr().unwrap(),listener.local_addr().unwrap().port(),token_path.display());
+    println!("Sharebox master listening on http://{}\nDashboard: http://localhost:{}\nAdmin token: {admin}\nSaved at {}\nTrusted private LAN only: HTTP is unencrypted. Native tasks use worker account permissions.",bound_addr,bound_addr.port(),token_path.display());
     let active = Arc::new(AtomicUsize::new(0));
     for socket in listener.incoming() {
         let Ok(mut socket) = socket else { continue };
@@ -714,7 +720,29 @@ mod tests {
             state: State::default(),
             path: PathBuf::new(),
             admin: "admin".into(),
+            bound_addr: "127.0.0.1:7331".parse().unwrap(),
         }
+    }
+    #[test]
+    fn network_info_requires_admin_and_uses_listener_address() {
+        let mut s = store();
+        s.bound_addr = "127.0.0.1:49152".parse().unwrap();
+        s.state.tokens.push(json!({"token":"agent"}));
+        assert_eq!(
+            handle(&mut s, &req("GET", "/api/network", "", json!({}))).status,
+            401
+        );
+        assert_eq!(
+            handle(&mut s, &req("GET", "/api/network", "agent", json!({}))).status,
+            403
+        );
+        let response = handle(&mut s, &req("GET", "/api/network", "admin", json!({})));
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"bindAddress":"127.0.0.1:49152", "localOnly":true, "urls":[]})
+        );
     }
     #[test]
     fn pairing_is_single_use() {

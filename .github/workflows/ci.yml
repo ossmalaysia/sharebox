@@ -49,6 +49,10 @@ jobs:
         env:
           SHAREBOX_BIN: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}
         run: python tests/e2e.py
+      - name: Check native tray initialization
+        if: runner.os != 'Linux'
+        shell: bash
+        run: ./target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }} tray --role master --dashboard http://127.0.0.1:7331 --check
       - name: Exercise native background service lifecycle when a user session is available
         env:
           SHAREBOX_BIN: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}

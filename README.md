@@ -108,6 +108,8 @@ For other computers on your private LAN to connect:
 ./target/release/sharebox master --bind 0.0.0.0:7331 --data .sharebox
 ```
 
+After logging in, the dashboard’s **Master LAN address** panel shows private IPv4 addresses detected on the master. Copy an address for another computer, or select the interface that shares its network. Worker pairing commands use that selection even when you opened the dashboard through `localhost`. Use **Refresh addresses** after changing networks. The panel warns when the master listens on loopback only or no private address is available; detection does not prove firewall reachability.
+
 Use the master's actual LAN address, for example `http://192.168.1.20:7331`. `0.0.0.0` is a listening address, not an address to give a worker. Permit the listening port through the master's firewall only for the intended private network. Keep the master running while workers are in use.
 
 ## Register and start a worker
@@ -189,6 +191,22 @@ Background output is discarded on Windows and macOS to avoid writing startup cre
 | Linux | systemd user service; requires a user service manager |
 
 These run under your account and start when you log in. They are not machine-wide services that run before login. Linux logout behavior depends on the user manager's configuration. Headful browser tests need a desktop session; headless E2E tests are recommended for background workers.
+
+## Menu bar and system tray
+
+Starting with v0.3.0, installing a master or worker service on macOS or Windows also installs a companion status icon. macOS uses the menu bar; Windows uses the system tray (the icon may initially be in the overflow menu). Linux remains a headless user service.
+
+Each installed role has its own icon and menu with service status, Open Dashboard, Start, Stop, Refresh Status, and Quit. Quitting the icon leaves the service running. Stopping a service leaves its icon available to start it again. Status reports the local service process; it does not prove a worker is connected to its master. Check the dashboard for worker connectivity and job results.
+
+For a service installed with v0.2.x, cancel or finish active jobs, uninstall its startup registration, update the binary, then install the service again using the same data/configuration path. This preserves workspace data and worker credentials while adding the icon's login registration:
+
+```sh
+sharebox service uninstall worker
+# Update the binary with the installer, then:
+sharebox service install worker --config /absolute/path/to/worker.json
+```
+
+For a master, use `service uninstall master` followed by `service install master --bind 0.0.0.0:7331 --data /absolute/path/to/.sharebox`. Foreground `master` and `worker` commands continue to use the terminal; status icons manage installed services.
 
 ## Connect an LLM
 

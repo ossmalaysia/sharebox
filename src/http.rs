@@ -1,12 +1,40 @@
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::TcpStream,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub const MAX_BODY: usize = 1024 * 1024;
+
+// A socket timeout alone restarts after every successful read. Bound the whole
+// message so a peer cannot retain a connection indefinitely by dripping bytes.
+struct DeadlineReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+impl<'a> DeadlineReader<'a> {
+    fn new(stream: &'a mut TcpStream, budget: Duration) -> Self {
+        Self {
+            stream,
+            deadline: Instant::now() + budget,
+        }
+    }
+}
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP message deadline exceeded")
+            })?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
+    }
+}
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -97,10 +125,7 @@ fn read_message(stream: &mut impl Read) -> Result<HttpMessage, String> {
     Ok((first, headers, body))
 }
 pub fn read_request(stream: &mut TcpStream) -> Result<Request, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
-    parse_request(stream)
+    parse_request(&mut DeadlineReader::new(stream, Duration::from_secs(10)))
 }
 fn parse_request(stream: &mut impl Read) -> Result<Request, String> {
     let (first, headers, body) = read_message(stream)?;
@@ -190,10 +215,10 @@ pub fn client_request(
         .write_all(head.as_bytes())
         .and_then(|_| stream.write_all(&data))
         .map_err(|e| e.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| e.to_string())?;
-    let (first, _, bytes) = read_message(&mut stream)?;
+    let (first, _, bytes) = read_message(&mut DeadlineReader::new(
+        &mut stream,
+        Duration::from_secs(10),
+    ))?;
     let status = first.split_whitespace().nth(1).unwrap_or("500");
     let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if !status.starts_with('2') {
@@ -213,6 +238,39 @@ mod tests {
     use super::*;
     fn parse(raw: &[u8]) -> Result<Request, String> {
         parse_request(&mut std::io::Cursor::new(raw))
+    }
+    #[test]
+    fn continuous_bytes_do_not_extend_the_read_deadline() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(address).unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            // Always finish within three seconds even if the deadline regresses.
+            for _ in 0..300 {
+                if socket.write_all(b"x").is_err()
+                    || stopped.recv_timeout(Duration::from_millis(10)).is_ok()
+                {
+                    break;
+                }
+            }
+        });
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut received = Vec::new();
+        let result =
+            DeadlineReader::new(&mut socket, Duration::from_millis(100)).read_to_end(&mut received);
+        let _ = stop.send(());
+        sender.join().unwrap();
+        let error = result.expect_err("Continuous traffic must still hit the absolute deadline");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
     }
     #[test]
     fn rejects_smuggling() {
