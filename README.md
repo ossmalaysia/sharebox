@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/ossmalaysia/sharebox/main/scripts/i
 "$HOME/.local/bin/sharebox" --version
 ```
 
-Use the same custom installation directory if you originally supplied one. After updating, restart the same master/worker command with the same data/config path, or use `sharebox service start master` / `sharebox service start worker`. Service commands require a release containing this feature; v0.1.0 does not include them.
+Use the same custom installation directory if you originally supplied one. After updating, restart the same master/worker command with the same data/config path, or use `sharebox service start master` / `sharebox service start worker`. Service commands require v0.2.0 or later.
 
 ## Build
 
@@ -147,7 +147,7 @@ Keep `worker.json` private after pairing: it contains a credential. This version
 
 ## Run automatically in the background
 
-Service support in this branch is not included in v0.1.0. Build this branch or install a release that includes it before using these commands.
+Service support requires v0.2.0 or later. Check `sharebox --version` before using these commands.
 
 Install Sharebox in its permanent location first. Stop the foreground process, then register a background master from the same directory you previously ran it in, so the existing `.sharebox` data and tokens are preserved:
 
