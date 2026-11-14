@@ -122,7 +122,7 @@ fn spec(role: &str, opts: &HashMap<String, String>) -> Result<Spec> {
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
-    if args.is_empty() || args == ["--help"] || args == ["help"] {
+    if args.is_empty() || args == ["--help"] || args == ["-h"] || args == ["help"] {
         println!("{HELP}");
         return Ok(());
     }
