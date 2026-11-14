@@ -14,6 +14,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked
 python tests/e2e.py
+python tests/snapshots.py
 ```
 
 For dashboard changes, install the pinned browser test dependency and run the real browser flow:
@@ -48,3 +49,5 @@ The manually dispatched **Format Rust** workflow formats the selected branch and
 The release job has write permission only when publishing. Actions are pinned to commit SHAs, and Dependabot proposes updates. Checksums verify consistency with the release manifest; they are not independent publisher signatures. macOS builds are not notarized and Windows builds are not Authenticode-signed.
 
 By submitting a contribution, you agree to license it under the project's [MIT license](LICENSE). Contributors retain their copyright. Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Snapshot changes also require the Docker integration path on a host with a preloaded suitable image: `SHAREBOX_DOCKER_IMAGE=node:22-bookworm-slim python tests/snapshots.py`. CI uses a pinned image digest. Never enable uploaded-code execution in a real worker configuration as part of tests.

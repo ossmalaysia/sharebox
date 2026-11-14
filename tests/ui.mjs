@@ -156,6 +156,7 @@ try {
   const config = JSON.parse(await readFile(configPath, 'utf8'));
   config.name = 'UI test worker';
   config.tasks['node-smoke'].argv[0] = process.execPath;
+  config.tasks['snapshot-ui'] = { description: 'Run uploaded UI test source', argv: [process.execPath, 'test.js'], cwd: temporary, timeoutSeconds: 30, snapshot: { mode: 'native' } };
   await writeFile(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
   const worker = start('worker', ['worker', '--server', origin, '--code', code, '--config', configPath]);
   const workerCard = page.locator('#worker-list article').filter({ has: page.getByRole('heading', { name: 'UI test worker', exact: true }) });
@@ -220,9 +221,11 @@ try {
   await page.locator('#copy-setup').click();
   assert.equal(await page.locator('.clipboard-fallback.manual-copy').inputValue(), shellSetup);
   await page.getByLabel('Client and terminal').selectOption('claude-powershell');
-  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${configuredMcpUrl}' --header 'Authorization: Bearer ${token}'`);
+  assert.ok((await page.locator('#mcp-setup').innerText()).endsWith(`claude mcp add --transport http --scope user sharebox '${configuredMcpUrl}' --header 'Authorization: Bearer ${token}'`));
+  assert.ok((await page.locator('#mcp-setup').innerText()).includes('SHAREBOX_MCP_TOKEN'));
   await page.getByLabel('Client and terminal').selectOption('claude-shell');
-  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${configuredMcpUrl}' --header 'Authorization: Bearer ${token}'`);
+  assert.ok((await page.locator('#mcp-setup').innerText()).endsWith(`claude mcp add --transport http --scope user sharebox '${configuredMcpUrl}' --header 'Authorization: Bearer ${token}'`));
+  assert.ok((await page.locator('#mcp-setup').innerText()).includes('SHAREBOX_MCP_TOKEN'));
   await page.getByLabel('Client and terminal').selectOption('json');
   assert.deepEqual(JSON.parse(await page.locator('#mcp-setup').innerText()), clientConfig);
 
@@ -235,6 +238,28 @@ try {
   assert.equal(probe.status, 200, 'UI-issued token must authenticate an MCP request');
   assert.ok((await probe.json()).result.tools.some(tool => tool.name === 'submit_job'));
   await page.getByRole('button', { name: 'I’ve saved the token' }).click();
+  const snapshotSource = path.join(temporary, 'snapshot-source');
+  await mkdir(snapshotSource);
+  await writeFile(path.join(snapshotSource, 'test.js'), "console.log('UI snapshot source executed');\n");
+  process.env.SHAREBOX_UI_TOKEN = token;
+  let uploader;
+  try { uploader = start('snapshot upload', ['snapshot', 'upload', '--directory', snapshotSource, '--server', origin, '--token-env', 'SHAREBOX_UI_TOKEN']); }
+  finally { delete process.env.SHAREBOX_UI_TOKEN; }
+  await until(() => uploader.error ? Promise.reject(uploader.error) : uploader.child.exitCode !== null, 'snapshot upload');
+  assert.equal(uploader.child.exitCode, 0, redact(uploader.log));
+  const snapshot = JSON.parse(uploader.log);
+  await workerCard.getByRole('button', { name: 'Run task' }).click();
+  await page.getByLabel('Allowed task').selectOption('snapshot-ui');
+  await page.getByLabel('Uploaded snapshot ID').fill(snapshot.snapshotId);
+  await page.locator('#job-form').getByRole('button', { name: 'Delegate task' }).click();
+  await page.locator('#modal .status').filter({ hasText: /^passed$/ }).waitFor({ timeout: 45_000 });
+  assert.ok((await page.locator('#job-output').innerText()).includes('UI snapshot source executed'));
+  assert.ok((await page.locator('#modal-content').innerText()).includes(snapshot.snapshotId));
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Snapshot identity should fit the mobile dialog');
+  await page.locator('#modal').getByRole('button', { name: 'Close', exact: true }).click();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  console.log('PASS: real snapshot upload, dashboard source selection, executed uploaded source and exact snapshot identity');
   const tokenRow = page.locator('#token-list .token-row').filter({ hasText: 'UI smoke agent' });
   await tokenRow.getByRole('button', { name: 'Revoke', exact: true }).click();
   await page.getByRole('heading', { name: 'Revoke MCP token?' }).waitFor();
