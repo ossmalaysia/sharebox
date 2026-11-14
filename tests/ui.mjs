@@ -17,11 +17,15 @@ const sensitive = new Set();
 let browser;
 let page;
 let failed = false;
+let origin;
+let admin;
 
 function redact(value) {
   let text = String(value);
   for (const secret of sensitive) if (secret) text = text.replaceAll(secret, '[REDACTED]');
-  return text.replace(/(admin(?:istrator)? token\s*[:=]\s*)\S+/gi, '$1[REDACTED]');
+  return text
+    .replace(/(admin(?:istrator)? token\s*[:=]\s*)\S+/gi, '$1[REDACTED]')
+    .replace(/\b[0-9a-f]{64}\b/gi, '[REDACTED]');
 }
 
 function start(label, args) {
@@ -67,7 +71,7 @@ async function stop(child) {
 try {
   await mkdir(output, { recursive: true });
   const port = await unusedPort();
-  const origin = `http://127.0.0.1:${port}`;
+  origin = `http://127.0.0.1:${port}`;
   const state = path.join(temporary, 'state');
   const master = start('master', ['master', '--bind', `127.0.0.1:${port}`, '--data', state]);
   await until(async () => {
@@ -76,7 +80,7 @@ try {
     const response = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(1500) });
     return response.ok;
   }, 'master health');
-  const admin = (await readFile(path.join(state, 'admin-token'), 'utf8')).trim();
+  admin = (await readFile(path.join(state, 'admin-token'), 'utf8')).trim();
   sensitive.add(admin);
 
   browser = await chromium.launch({ headless: true });
@@ -126,6 +130,8 @@ try {
   await page.getByLabel('Allowed task').selectOption('node-smoke');
   await page.locator('#job-form').getByRole('button', { name: 'Delegate task' }).click();
   await page.locator('#modal-title').filter({ hasText: 'node-smoke' }).waitFor();
+  await page.locator('#modal .status').waitFor();
+  console.log(`Job details opened with status: ${await page.locator('#modal .status').innerText()}`);
   await page.locator('#modal .status').filter({ hasText: /^passed$/ }).waitFor({ timeout: 45_000 });
   await page.locator('#job-output').filter({ hasText: 'remote Node test' }).waitFor();
   assert.match(await page.locator('#job-output').innerText(), /pass 1|tests 1/);
@@ -171,7 +177,24 @@ try {
 } catch (error) {
   failed = true;
   console.error(redact(error.stack || error));
+  if (origin && admin) {
+    try {
+      const response = await fetch(`${origin}/api/workspace`, { headers: { Authorization: `Bearer ${admin}` }, signal: AbortSignal.timeout(3000) });
+      const data = await response.json();
+      // Explicitly project diagnostics; never write workspace token records or credentials.
+      const state = {
+        httpStatus: response.status,
+        error: typeof data.error === 'string' ? data.error : undefined,
+        workers: (data.workers || []).map(({ id, name, lastSeen, revoked }) => ({ id, name, lastSeen, revoked })),
+        jobs: (data.jobs || []).map(({ id, task, workerId, status, exitCode, createdAt, updatedAt }) => ({ id, task, workerId, status, exitCode, createdAt, updatedAt })),
+      };
+      await writeFile(path.join(output, 'ui-state.json'), redact(JSON.stringify(state, null, 2)));
+      console.error('Failure workspace state:', redact(JSON.stringify(state)));
+    } catch (diagnosticError) { browserMessages.push(`Workspace diagnostics unavailable: ${redact(diagnosticError.message)}`); }
+  }
   if (page && !page.isClosed()) {
+    try { await writeFile(path.join(output, 'ui-page.txt'), redact(await page.locator('body').innerText({ timeout: 3000 }))); }
+    catch (diagnosticError) { browserMessages.push(`Page diagnostics unavailable: ${redact(diagnosticError.message)}`); }
     try { await page.screenshot({ path: path.join(output, 'ui-failure.png'), fullPage: true, mask: [page.locator('#admin-token'), page.locator('#modal .secret'), page.locator('#modal .command')] }); } catch { /* Keep the original failure. */ }
   }
 } finally {

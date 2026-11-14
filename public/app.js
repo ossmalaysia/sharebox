@@ -186,7 +186,12 @@ document.addEventListener('click', event => {
 $('#login-form').onsubmit = async event => { event.preventDefault(); const button = $('#login-form button[type="submit"]'); button.disabled = true; showError($('#login-error'), ''); setToken($('#admin-token').value.trim()); try { await connect(); $('#admin-token').value = ''; } catch (error) { setToken(''); showError($('#login-error'), error.message); } finally { button.disabled = false; } };
 $('#logout').onclick = () => disconnect();
 $('#close-modal').onclick = closeModal;
-$('#modal').addEventListener('close', () => { selectedJobId = null; modalKind = ''; $('#modal-content').replaceChildren(); });
+$('#modal').addEventListener('close', () => {
+  // A queued close event can arrive after an async action opens the next dialog.
+  // Never erase that new dialog or stop its live job polling.
+  if ($('#modal').open) return;
+  selectedJobId = null; modalKind = ''; $('#modal-content').replaceChildren();
+});
 $('#modal').addEventListener('click', event => { if (event.target !== $('#modal')) return; const r = $('#modal').getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) closeModal(); });
 $('#job-filter').onchange = renderJobs;
 $('#copy-endpoint').onclick = () => copy(`${location.origin}/mcp`);

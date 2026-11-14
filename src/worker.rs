@@ -277,12 +277,18 @@ impl Connection {
             {
                 return Err("invalid job ID".into());
             }
-            self.post(
+            let response = self.post(
                 &format!("/api/worker/jobs/{}/events", pending.job_id),
                 event,
             )?;
+            let rejected_start = response["ignored"].as_bool() == Some(true)
+                && event.status.as_deref() == Some("running")
+                && !pending.finished;
             pending.events.remove(0);
             pending.save(path)?;
+            if rejected_start {
+                return Err("HTTP 409: job no longer executable".into());
+            }
             sent += 1;
         }
         Ok(())
@@ -349,9 +355,9 @@ impl Connection {
         );
         pending.save(state_path)?;
         if let Err(e) = self.flush(&mut pending, state_path) {
-            if permanent(&e) {
-                return Err(format!("Job start rejected; nothing was executed: {e}"));
-            }
+            return Err(format!(
+                "Job start was not acknowledged; nothing was executed and pending state was retained: {e}"
+            ));
         }
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -947,6 +953,59 @@ mod tests {
             )
             .is_err());
         assert!(!d.join("executed").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn ignored_or_unacknowledged_start_never_executes() {
+        for response in [
+            Ok(json!({"ok":true,"ignored":true,"reason":"Job already terminal"})),
+            Err("Connection timed out".to_string()),
+        ] {
+            let server = FakeServer::start(false);
+            let d = dir();
+            let mut connection = runner(
+                &server,
+                &d,
+                "require('node:fs').writeFileSync('executed','bad')",
+                5,
+            );
+            connection.mock = Some(Arc::new(move |_, _| response.clone()));
+            let pending_path = d.join("pending.json");
+            let result = connection.execute(
+                Job {
+                    id: "job-terminal-start".into(),
+                    task: "test".into(),
+                    timeout_seconds: 5,
+                },
+                &pending_path,
+            );
+            assert!(result.unwrap_err().contains("nothing was executed"));
+            assert!(!d.join("executed").exists());
+            assert!(pending_path.exists());
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_recovery_drains_ignored_events_without_restarting() {
+        let server = FakeServer::start(false);
+        let d = dir();
+        let mut connection = runner(&server, &d, "process.exit(99)", 5);
+        connection.mock = Some(Arc::new(|_, _| Ok(json!({"ok":true,"ignored":true}))));
+        let mut pending = Pending {
+            job_id: "job-recovery".into(),
+            sequence: 0,
+            finished: true,
+            events: vec![],
+        };
+        pending.add(None, Some("running"), None);
+        pending.add(None, Some("failed"), Some(-1));
+        let path = d.join("pending.json");
+        pending.save(&path).unwrap();
+        connection.deliver(&mut pending, &path).unwrap();
+        assert!(!path.exists());
+        assert!(pending.events.is_empty());
         std::fs::remove_dir_all(d).unwrap();
     }
 }
