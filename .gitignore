@@ -1,0 +1,8 @@
+/target/
+/.cargo-home/
+/.sharebox/
+/worker.json
+/worker.credentials.json
+/test-output/
+*.log
+

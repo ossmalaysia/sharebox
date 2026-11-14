@@ -1,0 +1,102 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Validate release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          tag = os.environ['RELEASE_TAG']
+          version = re.search(r'^version = "([^"]+)"', pathlib.Path('Cargo.toml').read_text(), re.M).group(1)
+          if tag != 'v' + version:
+              raise SystemExit('Tag must match Cargo.toml version: v' + version)
+          PY
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - run: cargo +stable test --locked --target ${{ matrix.target }}
+      - run: cargo +stable build --release --locked --target ${{ matrix.target }}
+      - name: Package binary and checksum
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import hashlib, os, pathlib, tarfile, zipfile
+          target = os.environ['RELEASE_TARGET']
+          windows = 'windows' in target
+          binary = 'sharebox.exe' if windows else 'sharebox'
+          source = pathlib.Path('target') / target / 'release' / binary
+          out = pathlib.Path('dist'); out.mkdir(exist_ok=True)
+          archive = out / ('sharebox-' + target + ('.zip' if windows else '.tar.gz'))
+          items = [(source, binary), (pathlib.Path('LICENSE'), 'LICENSE'), (pathlib.Path('README.md'), 'README.md')]
+          if windows:
+              with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as handle:
+                  for path, name in items: handle.write(path, name)
+          else:
+              with tarfile.open(archive, 'w:gz') as handle:
+                  for path, name in items: handle.add(path, arcname=name)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (out / (archive.name + '.sha256')).write_text(digest + '  ' + archive.name + '\n')
+          PY
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cat dist/*.sha256 | sort -k2 > dist/SHA256SUMS
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "Sharebox $RELEASE_TAG" ./*.tar.gz ./*.zip SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false

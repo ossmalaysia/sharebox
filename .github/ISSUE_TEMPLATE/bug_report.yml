@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem (do not include secrets).
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version and operating systems
+      description: Include master and worker platforms.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Remove tokens, pairing codes, private paths, and personal data.

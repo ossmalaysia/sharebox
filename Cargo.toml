@@ -1,0 +1,17 @@
+[package]
+name = "sharebox"
+version = "0.1.0"
+edition = "2021"
+description = "Local network task runner with a dashboard and MCP endpoint"
+license = "MIT"
+
+[dependencies]
+serde = { version = "=1.0.218", features = ["derive"] }
+serde_json = "=1.0.140"
+libc = "=0.2.155"
+getrandom = "=0.2.15"
+
+[profile.release]
+lto = true
+strip = true
+

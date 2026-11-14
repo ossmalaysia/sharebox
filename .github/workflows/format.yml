@@ -1,0 +1,33 @@
+name: Format Rust
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: format-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  format:
+    if: startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: true
+      - name: Install formatter
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo +stable fmt --all
+      - name: Commit formatting when needed
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          git add -- '*.rs'
+          if git diff --cached --quiet; then
+            echo 'Rust source is already formatted.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'style: format Rust sources'
+          git push origin "HEAD:$BRANCH_NAME"
