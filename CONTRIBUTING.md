@@ -30,7 +30,7 @@ Add regression tests for behavioral fixes, especially authentication, job owners
 
 ## Reviews and merging
 
-Keep each pull request focused. Explain the user-visible outcome and relevant tradeoffs. The required `CI passed` check aggregates formatting, linting, and native platform tests. Maintainers should configure branch protection to require this check, one approving review, resolved discussions, and current branch status, while blocking force pushes and deletion. Repository configuration must be verified separately; this document does not activate those settings.
+Keep each pull request focused. Explain the user-visible outcome and relevant tradeoffs. The required `CI passed` check aggregates formatting, linting, and native platform tests. Maintainers should configure branch protection to require this check, resolved discussions, and current branch status, while blocking force pushes and deletion. The current solo-maintainer policy does not require another person’s approval; peer review is encouraged when another maintainer is available. Repository configuration must be verified separately; this document does not activate those settings.
 
 Maintainers can apply the included policy with `.github/configure-repository.sh` after authenticating GitHub CLI and creating `main`. The script also enables private vulnerability reporting. Run it only with authority to manage this repository.
 
@@ -39,7 +39,7 @@ The manually dispatched **Format Rust** workflow formats the selected branch and
 ## Releases
 
 1. Update the package version and lockfile in a pull request.
-2. Merge after review and green CI.
+2. Merge after green CI and any reviews required by the repository policy.
 3. Create a matching `vX.Y.Z` tag on that tested `main` commit.
 4. The release workflow reruns CI and builds native binaries for Linux x86_64, macOS ARM64/x86_64, and Windows x86_64.
 5. It uploads archives and `SHA256SUMS`, then publishes the draft only after all build jobs pass.

@@ -14,5 +14,5 @@ gh api --method PATCH "repos/$sharebox_repo" \
 gh api --method PUT "repos/$sharebox_repo/branches/main/protection" \
   --input "$sharebox_root/.github/branch-protection.json" --silent
 gh api --method PUT "repos/$sharebox_repo/private-vulnerability-reporting" --silent
-echo 'Repository settings applied. Required check: CI passed; one approval and resolved discussions; no force push or deletion.'
+echo 'Repository settings applied. Required check: CI passed; solo-maintainer mode with resolved discussions; no force push or deletion.'
 echo 'Review branch protection in GitHub before accepting contributions.'
