@@ -107,8 +107,26 @@ function closeModal() { selectedJobId = null; modalKind = ''; if ($('#modal').op
 function errorBox() { return '<div id="modal-error" class="alert hidden" role="alert"></div>'; }
 function modalError(error) { const target = $('#modal-error'); if (target) showError(target, error.message || String(error)); else notify(error.message || String(error)); }
 async function copy(text) {
+  document.querySelectorAll('.clipboard-fallback').forEach(field => field.remove());
   try { await navigator.clipboard.writeText(text); notify('Copied to clipboard.'); }
-  catch { notify('Clipboard is unavailable on this connection. Select and copy the displayed text.'); }
+  catch {
+    // The modern Clipboard API is unavailable on plain HTTP LAN origins.
+    const field = document.createElement('textarea');
+    field.value = text; field.className = 'clipboard-fallback';
+    field.setAttribute('aria-label', 'Text to copy'); field.readOnly = true;
+    const previous = document.activeElement;
+    ($('#modal').open ? $('#modal-content') : document.body).append(field);
+    field.focus(); field.select();
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch { /* Offer manual copy below. */ }
+    if (copied) { field.remove(); previous?.focus(); notify('Copied to clipboard.'); }
+    else {
+      field.classList.add('manual-copy');
+      notify('Press Ctrl+C (Command+C on Mac) to copy the selected text.');
+      // Keep the field until the dialog closes or another copy is requested.
+      // Removing it during blur can shift the button receiving the next click.
+    }
+  }
 }
 
 async function pairing() {
@@ -140,8 +158,36 @@ function connectMcp() {
     try {
       const name = $('#token-name').value.trim(); if (!name) throw new Error('Enter a connection name.');
       const result = await api('/api/tokens', { method: 'POST', body: { name } });
-      const config = JSON.stringify({ mcpServers: { sharebox: { url: `${location.origin}/mcp`, headers: { Authorization: `Bearer ${result.token}` } } } }, null, 2);
-      openModal(`<h2 id="modal-title">Your agent’s connection is ready</h2><p>Save this token now. It is shown only once. Configuration format varies between MCP clients; use these endpoint and authorization values.</p><div class="command-label"><strong>Bearer token</strong><button class="text-btn" id="copy-token">Copy token</button></div><div class="secret">${escapeHTML(result.token)}</div><div class="command-label"><strong>Example client configuration</strong><button class="text-btn" id="copy-config">Copy config</button></div><pre class="command">${escapeHTML(config)}</pre><p>The agent can discover workers, submit allowed tasks, inspect jobs and logs, and cancel jobs. Revoke this token from MCP connections to remove its access.</p><div class="actions"><button class="btn primary" data-action="close">I’ve saved the token</button></div>`, 'token-created');
+      if (modalKind !== 'token') return;
+      const endpoint = `${location.origin}/mcp`;
+      const config = JSON.stringify({ mcpServers: { sharebox: { type: 'http', url: endpoint, headers: { Authorization: `Bearer ${result.token}` } } } }, null, 2);
+      openModal(`<h2 id="modal-title">Your agent’s connection is ready</h2><p>Copy the setup command into a terminal on the machine running your agent. Your address and token are already filled in.</p><label for="mcp-client">Client and terminal</label><select id="mcp-client"><option value="codex-powershell">Codex · Windows PowerShell</option><option value="codex-shell">Codex · macOS / Linux (bash or zsh)</option><option value="claude-powershell">Claude Code · Windows PowerShell</option><option value="claude-shell">Claude Code · macOS / Linux</option><option value="json">Other client · JSON configuration</option></select><div class="command-label"><strong id="setup-label">Setup command</strong><button class="text-btn" id="copy-setup">Copy command</button></div><pre class="command" id="mcp-setup" tabindex="0"></pre><p class="input-help" id="setup-help"></p><p class="input-help">If your agent runs on another machine, use the master’s LAN IP instead of localhost. These commands contain a private token; do not commit or share them publicly.</p><details><summary>Token and JSON configuration</summary><p>Save this token now. It is shown only once.</p><div class="command-label"><strong>Bearer token</strong><button class="text-btn" id="copy-token">Copy token</button></div><div class="secret">${escapeHTML(result.token)}</div><div class="command-label"><strong>Example client configuration</strong><button class="text-btn" id="copy-config">Copy config</button></div><pre class="command" id="mcp-config">${escapeHTML(config)}</pre></details><p>The agent can discover workers, submit allowed tasks, inspect jobs and logs, and cancel jobs. Revoke this token from MCP connections to remove its access.</p><div class="actions"><button class="btn primary" data-action="close">I’ve saved the token</button></div>`, 'token-created');
+      const select = $('#mcp-client');
+      select.value = /Windows/i.test(navigator.userAgent) ? 'codex-powershell' : 'codex-shell';
+      const updateSetup = () => {
+        const client = select.value;
+        const powershell = client.endsWith('powershell');
+        const quote = powershell ? value => `'${value.replaceAll("'", "''")}'` : shellQuote;
+        let command;
+        let help;
+        if (client.startsWith('codex-')) {
+          const token = quote(result.token);
+          command = `${powershell ? `[Environment]::SetEnvironmentVariable('SHAREBOX_MCP_TOKEN', ${token}, 'User')\n$env:SHAREBOX_MCP_TOKEN = ` : 'export SHAREBOX_MCP_TOKEN='}${token}\ncodex mcp add sharebox --url ${quote(endpoint)} --bearer-token-env-var SHAREBOX_MCP_TOKEN\ncodex`;
+          help = powershell ? 'This saves the token in your Windows user environment and the connection in your Codex user configuration, then opens Codex. Exit an already running Codex session first. Restart other terminals and desktop apps to pick up the saved token. Use /mcp to check the connection.' : 'This registers Sharebox in your Codex user configuration, then opens Codex. The token lasts for this terminal session: repeat the export line before starting Codex in a new terminal. Exit an already running Codex session first and run this command in its terminal. Use /mcp to check the connection.';
+        } else if (client.startsWith('claude-')) {
+          command = `claude mcp add --transport http --scope user sharebox ${quote(endpoint)} --header ${quote(`Authorization: Bearer ${result.token}`)}`;
+          help = 'This saves the connection and token in your Claude Code user configuration. Restart Claude Code, then use /mcp to check the connection. If Sharebox is already registered, remove that entry with claude mcp remove sharebox before adding the replacement.';
+        } else {
+          command = config;
+          help = 'Merge this entry into your client’s MCP configuration. JSON formats vary by client; Codex uses TOML, so choose a Codex command above for Codex.';
+        }
+        $('#mcp-setup').textContent = command;
+        $('#setup-help').textContent = help;
+        $('#setup-label').textContent = client === 'json' ? 'Client configuration' : 'Setup command';
+        $('#copy-setup').textContent = client === 'json' ? 'Copy config' : 'Copy command';
+        $('#copy-setup').onclick = () => copy(command);
+      };
+      select.onchange = updateSetup; updateSetup();
       $('#copy-token').onclick = () => copy(result.token); $('#copy-config').onclick = () => copy(config); await refresh();
     } catch (error) { modalError(error); } finally { if (button.isConnected) button.disabled = false; }
   };

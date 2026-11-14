@@ -22,7 +22,7 @@ One executable provides master and worker modes. The master coordinates jobs; ea
 
 ## Install a release
 
-Installers become usable after the first [GitHub release](https://github.com/ossmalaysia/sharebox/releases) is published. Until then, build from source. Both installers download an official release archive and verify its SHA-256 against that release's `SHA256SUMS` before installing. They do not start a service or modify your shell configuration.
+Download a [GitHub release](https://github.com/ossmalaysia/sharebox/releases), or use an installer below. Both installers download an official release archive and verify its SHA-256 against that release's `SHA256SUMS` before installing. They do not start a service or modify your shell configuration.
 
 macOS or Linux:
 
@@ -51,6 +51,26 @@ Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/ossmalaysi
 ```
 
 Published targets are Linux x86_64 (GNU libc), macOS Apple Silicon and Intel, and Windows x86_64. Other targets require a source build. Release checksums detect download corruption and archive mismatches; they are not independent publisher signatures. macOS binaries are not notarized and Windows binaries are not Authenticode-signed.
+
+## Update
+
+Stop Sharebox before replacing its executable (Ctrl+C for a foreground process, or `sharebox service stop master` / `sharebox service stop worker` for an installed background service). Run the same installer again to download the latest published release and verify its checksum. Keep your existing data directory and worker configuration; reinstalling the binary does not migrate or delete them.
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/ossmalaysia/sharebox/main/scripts/install.ps1').Content))
+& "$env:LOCALAPPDATA\Sharebox\bin\sharebox.exe" --version
+```
+
+macOS / Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ossmalaysia/sharebox/main/scripts/install.sh | sh
+"$HOME/.local/bin/sharebox" --version
+```
+
+Use the same custom installation directory if you originally supplied one. After updating, restart the same master/worker command with the same data/config path, or use `sharebox service start master` / `sharebox service start worker`. Service commands require a release containing this feature; v0.1.0 does not include them.
 
 ## Build
 
@@ -125,9 +145,58 @@ On Windows PowerShell, use `.\sharebox.exe` in place of `./sharebox`. Pairing sa
 
 Keep `worker.json` private after pairing: it contains a credential. This version runs one task at a time per worker. Standard output and standard error are captured with a size cap; long output may be truncated. The master can request cancellation, and each task has a configured timeout.
 
+## Run automatically in the background
+
+Service support in this branch is not included in v0.1.0. Build this branch or install a release that includes it before using these commands.
+
+Install Sharebox in its permanent location first. Stop the foreground process, then register a background master from the same directory you previously ran it in, so the existing `.sharebox` data and tokens are preserved:
+
+```powershell
+& "$env:LOCALAPPDATA\Sharebox\bin\sharebox.exe" service install master --bind 0.0.0.0:7331 --data .sharebox
+```
+
+On macOS / Linux:
+
+```sh
+"$HOME/.local/bin/sharebox" service install master --bind 0.0.0.0:7331 --data .sharebox
+```
+
+The command registers the master and requests its start. Use `sharebox service status master` to inspect the service manager’s state. Open `http://127.0.0.1:7331`; read the administrator token from the selected data directory's `admin-token` file. Keep the firewall limited to your trusted private network. Use `--bind 127.0.0.1:7331` for a master that only accepts connections from its own computer.
+
+For a worker, pair it once using the foreground command above, stop it with Ctrl+C, then install it with the same configuration:
+
+```sh
+sharebox service install worker --config worker.json
+```
+
+Paths are resolved at installation time, so future startup does not depend on your terminal's working directory. The registered executable must stay at its installed path. Worker task commands still use your local allowlist and account permissions; use absolute executable paths for Node and other tools when possible.
+
+```sh
+sharebox service status master
+sharebox service stop master
+sharebox service start master
+sharebox service uninstall master
+```
+
+Replace `master` with `worker` to manage that role. Cancel or finish active jobs before stopping, updating, or uninstalling a worker; service-manager termination is not a graceful job cancellation. Uninstall removes the startup registration, preserving master data and worker credentials.
+
+Background output is discarded on Windows and macOS to avoid writing startup credentials or unbounded log files. For startup troubleshooting, stop the service and run the same master/worker command in the foreground. Linux sends standard error to the system journal.
+
+| Platform | Background startup |
+| --- | --- |
+| Windows | Task Scheduler task for the current user, at login |
+| macOS | LaunchAgent for the current user's login session |
+| Linux | systemd user service; requires a user service manager |
+
+These run under your account and start when you log in. They are not machine-wide services that run before login. Linux logout behavior depends on the user manager's configuration. Headful browser tests need a desktop session; headless E2E tests are recommended for background workers.
+
 ## Connect an LLM
 
-Create an MCP token in the dashboard and configure a compatible client with:
+In the dashboard, select **Connect MCP**, create a token, choose **Codex** or **Claude Code** and your terminal, then click **Copy command**. Paste into PowerShell or a shell on the computer running the agent. The command includes the endpoint and token. If the agent is on a different computer, open the dashboard using the master’s LAN address so that address is used in the command.
+
+The Windows Codex command saves the token in your user environment and current shell, registers Sharebox, and starts Codex. Restart other terminals or desktop clients to pick up the environment change. The macOS/Linux command exports the token for the current terminal session; repeat that export before launching Codex from a new terminal. Keep copied commands private.
+
+For another compatible MCP client, use:
 
 ```text
 Transport: Streamable HTTP

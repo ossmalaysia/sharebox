@@ -49,6 +49,10 @@ jobs:
         env:
           SHAREBOX_BIN: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}
         run: python tests/e2e.py
+      - name: Exercise native background service lifecycle when a user session is available
+        env:
+          SHAREBOX_BIN: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: python tests/service.py
       - name: Check PowerShell installer syntax
         if: runner.os == 'Windows'
         shell: pwsh

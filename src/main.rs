@@ -1,5 +1,6 @@
 mod http;
 mod master;
+mod service;
 mod worker;
 
 fn main() {
@@ -12,12 +13,15 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
     if matches!(command.as_str(), "" | "help" | "--help" | "-h") {
-        println!("Sharebox {} — trusted LAN task runner\n\nsharebox master [--bind 0.0.0.0:7331] [--data .sharebox]\nsharebox init [--config worker.json]\nsharebox worker [--server http://MASTER_IP:7331] [--code PAIR_CODE] [--config worker.json]\n\nNative tasks run with the worker account's permissions. HTTP is for trusted private LANs only.",env!("CARGO_PKG_VERSION"));
+        println!("Sharebox {} — trusted LAN task runner\n\nsharebox master [--bind 0.0.0.0:7331] [--data .sharebox]\nsharebox init [--config worker.json]\nsharebox worker [--server http://MASTER_IP:7331] [--code PAIR_CODE] [--config worker.json]\nsharebox service --help\n\nNative tasks run with the worker account's permissions. HTTP is for trusted private LANs only.",env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if command == "--version" {
         println!("sharebox {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if command == "service" {
+        return service::run(args.collect());
     }
     let mut opts = std::collections::HashMap::new();
     while let Some(k) = args.next() {

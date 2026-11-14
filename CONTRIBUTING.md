@@ -16,6 +16,16 @@ cargo build --locked
 python tests/e2e.py
 ```
 
+For dashboard changes, install the pinned browser test dependency and run the real browser flow:
+
+```sh
+npm install --no-save --package-lock=false --ignore-scripts playwright@1.56.1
+npx playwright install chromium
+node tests/ui.mjs
+```
+
+For background startup changes, run `python tests/service.py`. It temporarily registers a native master service, verifies stop/start/uninstall and retained state, and removes the registration. It preserves existing Sharebox services and explicitly skips when a native user session is unavailable. Use `SHAREBOX_REQUIRE_SERVICE_TEST=1` on a dedicated test host to treat skips as failures. A skipped lifecycle test is not evidence that that platform's service startup works.
+
 Add regression tests for behavioral fixes, especially authentication, job ownership, cancellation, persistence, and HTTP parsing. Do not commit tokens, pairing codes, local worker configs, or generated data. Include the operating systems you tested in the pull request.
 
 ## Reviews and merging
