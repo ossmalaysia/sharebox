@@ -144,12 +144,46 @@ try {
   await page.getByLabel('Connection name').fill('UI smoke agent');
   await page.getByRole('button', { name: 'Create MCP token' }).click();
   await page.getByRole('heading', { name: 'Your agent’s connection is ready' }).waitFor();
+  await page.locator('#modal summary').click();
   const token = (await page.locator('#modal .secret').innerText()).trim();
   sensitive.add(token);
   assert.ok(token.length >= 32, 'MCP token should contain sufficient random material');
-  const clientConfig = JSON.parse(await page.locator('#modal .command').innerText());
+  const clientConfig = JSON.parse(await page.locator('#mcp-config').innerText());
   assert.equal(clientConfig.mcpServers.sharebox.url, `${origin}/mcp`);
   assert.equal(clientConfig.mcpServers.sharebox.headers.Authorization, `Bearer ${token}`);
+  assert.equal(clientConfig.mcpServers.sharebox.type, 'http');
+  await page.getByLabel('Client and terminal').selectOption('codex-powershell');
+  const windowsSetup = await page.locator('#mcp-setup').innerText();
+  assert.ok(windowsSetup.includes(`[Environment]::SetEnvironmentVariable('SHAREBOX_MCP_TOKEN', '${token}', 'User')`));
+  assert.ok(windowsSetup.includes(`$env:SHAREBOX_MCP_TOKEN = '${token}'`));
+  assert.ok(windowsSetup.includes(`codex mcp add sharebox --url '${origin}/mcp' --bearer-token-env-var SHAREBOX_MCP_TOKEN`));
+  await page.getByLabel('Client and terminal').selectOption('codex-shell');
+  const shellSetup = await page.locator('#mcp-setup').innerText();
+  assert.ok(shellSetup.startsWith(`export SHAREBOX_MCP_TOKEN='${token}'\n`));
+  assert.ok(shellSetup.endsWith('\ncodex'));
+  // Force the plain HTTP LAN path: modern clipboard unavailable, legacy copy succeeds.
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    document.execCommand = command => {
+      if (command !== 'copy') return false;
+      window.copiedSetup = document.activeElement.value;
+      return true;
+    };
+  });
+  await page.locator('#copy-setup').click();
+  assert.equal(await page.evaluate(() => window.copiedSetup), shellSetup);
+  assert.equal(await page.locator('.clipboard-fallback').count(), 0);
+  // A browser that blocks both methods should leave selected text for manual copy.
+  await page.evaluate(() => { document.execCommand = () => false; });
+  await page.locator('#copy-setup').click();
+  assert.equal(await page.locator('.clipboard-fallback.manual-copy').inputValue(), shellSetup);
+  await page.getByLabel('Client and terminal').selectOption('claude-powershell');
+  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${origin}/mcp' --header 'Authorization: Bearer ${token}'`);
+  await page.getByLabel('Client and terminal').selectOption('claude-shell');
+  assert.equal(await page.locator('#mcp-setup').innerText(), `claude mcp add --transport http --scope user sharebox '${origin}/mcp' --header 'Authorization: Bearer ${token}'`);
+  await page.getByLabel('Client and terminal').selectOption('json');
+  assert.deepEqual(JSON.parse(await page.locator('#mcp-setup').innerText()), clientConfig);
+
   const probe = await fetch(`${origin}/mcp`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -213,7 +247,7 @@ try {
     } catch (diagnosticError) { browserMessages.push(`Layout diagnostics unavailable: ${redact(diagnosticError.message)}`); }
     try { await writeFile(path.join(output, 'ui-page.txt'), redact(await page.locator('body').innerText({ timeout: 3000 }))); }
     catch (diagnosticError) { browserMessages.push(`Page diagnostics unavailable: ${redact(diagnosticError.message)}`); }
-    try { await page.screenshot({ path: path.join(output, 'ui-failure.png'), fullPage: true, mask: [page.locator('#admin-token'), page.locator('#modal .secret'), page.locator('#modal .command')] }); } catch { /* Keep the original failure. */ }
+    try { await page.screenshot({ path: path.join(output, 'ui-failure.png'), fullPage: true, mask: [page.locator('#admin-token'), page.locator('#modal .secret'), page.locator('#modal .command'), page.locator('.clipboard-fallback')] }); } catch { /* Keep the original failure. */ }
   }
 } finally {
   if (browser) await browser.close().catch(() => {});

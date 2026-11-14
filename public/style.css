@@ -14,3 +14,5 @@
   nav{min-width:0;max-width:100%}
   nav a{flex:0 0 auto}
 }
+
+.clipboard-fallback{position:fixed;left:0;top:0;width:1px;height:1px;opacity:0}.clipboard-fallback.manual-copy{position:static;width:100%;height:130px;opacity:1;font:11px/1.6 ui-monospace,monospace}dialog summary{cursor:pointer;font-size:12px;margin:18px 0}dialog details p{margin-top:12px}
