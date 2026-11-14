@@ -115,6 +115,14 @@ def main():
             assert (data / "admin-token").read_text().strip() == token
             assert (data / "state.json").is_file(), "uninstall must preserve workspace state"
             attempted = False
+        except Exception:
+            # Preserve startup diagnostics before removing the temporary unit.
+            diagnostic = service("status", "master", check=False)
+            print(diagnostic.stdout, diagnostic.stderr, flush=True)
+            if system == "Linux":
+                journal = command(["journalctl", "--user", "-u", "sharebox-master.service", "--no-pager", "-n", "30"])
+                print(journal.stdout, journal.stderr, flush=True)
+            raise
         finally:
             if attempted:
                 # Installation may have failed after registering with the OS.
