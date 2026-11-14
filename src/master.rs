@@ -102,7 +102,10 @@ impl Store {
             {
                 job["status"] = json!("lost");
                 job["updatedAt"] = json!(t);
-                job["log"]=json!(format!("{}\n[master] Worker heartbeat lost; job will not be automatically retried.\n",job["log"].as_str().unwrap_or("")));
+                job["log"] = json!(format!(
+                    "{}\n[master] Worker heartbeat lost; job will not be automatically retried.\n",
+                    job["log"].as_str().unwrap_or("")
+                ));
             }
         }
     }
@@ -777,24 +780,40 @@ mod tests {
     #[test]
     fn idle_heartbeats_do_not_extend_lost_assignment() {
         let mut s = store();
-        s.state.workers.push(json!({"id":"w","token":"worker","lastSeen":now()}));
-        s.state.jobs.push(json!({"id":"job-a","workerId":"w","status":"running","leaseAt":now()-91_000,"log":""}));
+        s.state
+            .workers
+            .push(json!({"id":"w","token":"worker","lastSeen":now()}));
+        s.state.jobs.push(
+            json!({"id":"job-a","workerId":"w","status":"running","leaseAt":now()-91_000,"log":""}),
+        );
         s.expire();
         assert_eq!(s.state.jobs[0]["status"], "lost");
-        let response = worker_api(&mut s, "w", &req("POST", "/api/worker/jobs/job-a/events", "worker", json!({})), &json!({"sequence":1,"status":"passed"}));
+        let response = worker_api(
+            &mut s,
+            "w",
+            &req("POST", "/api/worker/jobs/job-a/events", "worker", json!({})),
+            &json!({"sequence":1,"status":"passed"}),
+        );
         assert_eq!(response.status, 200);
         assert_eq!(s.state.jobs[0]["status"], "lost");
     }
     #[test]
     fn duplicate_events_do_not_duplicate_logs() {
         let mut s = store();
-        s.state.workers.push(json!({"id":"w","token":"worker","lastSeen":now()}));
-        s.state.jobs.push(json!({"id":"job-a","workerId":"w","status":"running","sequence":0,"log":""}));
+        s.state
+            .workers
+            .push(json!({"id":"w","token":"worker","lastSeen":now()}));
+        s.state
+            .jobs
+            .push(json!({"id":"job-a","workerId":"w","status":"running","sequence":0,"log":""}));
         let r = req("POST", "/api/worker/jobs/job-a/events", "worker", json!({}));
         let body = json!({"sequence":1,"log":"only once"});
         assert_eq!(worker_api(&mut s, "w", &r, &body).status, 200);
         assert_eq!(worker_api(&mut s, "w", &r, &body).status, 200);
         assert_eq!(s.state.jobs[0]["log"], "only once");
-        assert_eq!(worker_api(&mut s, "w", &r, &json!({"sequence":3})).status, 409);
+        assert_eq!(
+            worker_api(&mut s, "w", &r, &json!({"sequence":3})).status,
+            409
+        );
     }
 }

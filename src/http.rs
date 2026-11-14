@@ -159,9 +159,7 @@ pub fn client_request(
         format!("{address}:80")
     };
     use std::net::ToSocketAddrs;
-    let addresses = host
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?;
+    let addresses = host.to_socket_addrs().map_err(|e| e.to_string())?;
     let mut last_error = "No reachable server address".to_string();
     let mut connected = None;
     for address in addresses.take(8) {
