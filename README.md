@@ -63,7 +63,7 @@ cargo test --locked
 
 The executable is `target/release/sharebox` on macOS/Linux or `target/release/sharebox.exe` on Windows. Node.js and the test tools required by your tasks must also be installed on each worker. Use the installed command `sharebox` instead of the paths below if you installed a release.
 
-For the current development machine, an existing Rust toolchain and cached dependencies are available. The helper discovers that toolchain and uses the checkout's `.cargo-home` cache:
+For offline development with an existing Rust toolchain and populated dependency cache, the helper discovers that toolchain and uses the checkout's `.cargo-home` cache:
 
 ```sh
 ./scripts/dev.sh build --release --offline
@@ -172,8 +172,7 @@ CI checks formatting, Clippy, Rust tests, and the master/worker/MCP flow. A tag 
 - `src/`: Rust master, HTTP handling, MCP tools, and worker implementation.
 - `public/`: dashboard assets embedded or served by the master.
 - `scripts/dev.sh`: local Cargo/toolchain helper.
-- `index.html`: earlier static concept design; use the running master for the live dashboard.
 - `.sharebox/`: local master state, including private authentication material.
 - `.cargo-home/` and `target/`: local build cache and build output.
 
-The static concept design includes ideas such as cloud hosting and direct peer transfer that are not capabilities of this local implementation.
+The live dashboard reflects the capabilities of this local implementation.

@@ -5,4 +5,11 @@
 /worker.credentials.json
 /test-output/
 *.log
+**/__pycache__/
+/sharebox-demo/
+*.pending.json
+*.pending.*.json
+# Earlier local-only visual exploration; not part of the product.
+/index.html
 
+/node_modules/

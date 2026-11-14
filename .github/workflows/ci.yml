@@ -24,6 +24,8 @@ jobs:
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
       - name: Check shell installer
         run: sh -n scripts/install.sh
+      - name: Test installer integrity checks offline
+        run: sh tests/install.sh
   test:
     name: Test (${{ matrix.os }})
     strategy:
@@ -55,14 +57,37 @@ jobs:
           $tokens = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1), [ref]$tokens, [ref]$parseErrors) | Out-Null
           if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+  browser:
+    name: Dashboard browser test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable build --locked
+      - run: npm install --no-save --package-lock=false --ignore-scripts playwright@1.56.1
+      - run: npx playwright install --with-deps chromium
+      - run: node tests/ui.mjs
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: dashboard-test
+          path: test-output/
+          retention-days: 7
   passed:
     name: CI passed
     if: always()
-    needs: [quality, test]
+    needs: [quality, test, browser]
     runs-on: ubuntu-24.04
     steps:
       - name: Require every check
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           TEST_RESULT: ${{ needs.test.result }}
-        run: test "$QUALITY_RESULT" = success && test "$TEST_RESULT" = success
+          BROWSER_RESULT: ${{ needs.browser.result }}
+        run: test "$QUALITY_RESULT" = success && test "$TEST_RESULT" = success && test "$BROWSER_RESULT" = success

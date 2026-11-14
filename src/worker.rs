@@ -163,11 +163,11 @@ fn private_write(path: &Path, contents: &[u8]) -> Result<()> {
     result.map_err(error)
 }
 #[cfg(not(windows))]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 #[cfg(windows)]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -229,10 +229,12 @@ fn descriptors(config: &Config) -> Vec<Value> {
         .map(|(name, t)| json!({"name":name,"description":t.description}))
         .collect()
 }
+#[cfg(test)]
+type MockTransport = Arc<dyn Fn(&str, &Value) -> Result<Value> + Send + Sync>;
 struct Connection {
     config: Config,
     #[cfg(test)]
-    mock: Option<Arc<dyn Fn(&str, &Value) -> Result<Value> + Send + Sync>>,
+    mock: Option<MockTransport>,
 }
 impl Connection {
     fn post(&self, path: &str, data: &impl Serialize) -> Result<Value> {

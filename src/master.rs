@@ -55,11 +55,8 @@ fn private_write(path: &Path, data: &[u8]) -> Result<(), String> {
     f.write_all(data)
         .and_then(|_| f.sync_all())
         .map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
-    }
-    fs::rename(tmp, path).map_err(|e| e.to_string())
+    drop(f);
+    crate::worker::replace_file(&tmp, path).map_err(|e| e.to_string())
 }
 impl Store {
     fn save(&self) -> Result<(), String> {
@@ -100,12 +97,12 @@ impl Store {
             .pairings
             .retain(|p| p["expiresAt"].as_u64().unwrap_or(0) > t);
         for job in &mut self.state.jobs {
-            if ["running", "cancelling"].contains(&job["status"].as_str().unwrap_or("")) {
-                if t.saturating_sub(job["leaseAt"].as_u64().unwrap_or(0)) > 90_000 {
-                    job["status"] = json!("lost");
-                    job["updatedAt"] = json!(t);
-                    job["log"]=json!(format!("{}\n[master] Worker heartbeat lost; job will not be automatically retried.\n",job["log"].as_str().unwrap_or("")));
-                }
+            if ["running", "cancelling"].contains(&job["status"].as_str().unwrap_or(""))
+                && t.saturating_sub(job["leaseAt"].as_u64().unwrap_or(0)) > 90_000
+            {
+                job["status"] = json!("lost");
+                job["updatedAt"] = json!(t);
+                job["log"]=json!(format!("{}\n[master] Worker heartbeat lost; job will not be automatically retried.\n",job["log"].as_str().unwrap_or("")));
             }
         }
     }
@@ -776,5 +773,28 @@ mod tests {
             serde_json::from_slice::<Value>(&r.body).unwrap()["job"],
             Value::Null
         );
+    }
+    #[test]
+    fn idle_heartbeats_do_not_extend_lost_assignment() {
+        let mut s = store();
+        s.state.workers.push(json!({"id":"w","token":"worker","lastSeen":now()}));
+        s.state.jobs.push(json!({"id":"job-a","workerId":"w","status":"running","leaseAt":now()-91_000,"log":""}));
+        s.expire();
+        assert_eq!(s.state.jobs[0]["status"], "lost");
+        let response = worker_api(&mut s, "w", &req("POST", "/api/worker/jobs/job-a/events", "worker", json!({})), &json!({"sequence":1,"status":"passed"}));
+        assert_eq!(response.status, 200);
+        assert_eq!(s.state.jobs[0]["status"], "lost");
+    }
+    #[test]
+    fn duplicate_events_do_not_duplicate_logs() {
+        let mut s = store();
+        s.state.workers.push(json!({"id":"w","token":"worker","lastSeen":now()}));
+        s.state.jobs.push(json!({"id":"job-a","workerId":"w","status":"running","sequence":0,"log":""}));
+        let r = req("POST", "/api/worker/jobs/job-a/events", "worker", json!({}));
+        let body = json!({"sequence":1,"log":"only once"});
+        assert_eq!(worker_api(&mut s, "w", &r, &body).status, 200);
+        assert_eq!(worker_api(&mut s, "w", &r, &body).status, 200);
+        assert_eq!(s.state.jobs[0]["log"], "only once");
+        assert_eq!(worker_api(&mut s, "w", &r, &json!({"sequence":3})).status, 409);
     }
 }

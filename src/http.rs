@@ -37,9 +37,8 @@ impl Response {
         }
     }
 }
-fn read_message(
-    stream: &mut impl Read,
-) -> Result<(String, HashMap<String, String>, Vec<u8>), String> {
+type HttpMessage = (String, HashMap<String, String>, Vec<u8>);
+fn read_message(stream: &mut impl Read) -> Result<HttpMessage, String> {
     let mut data = Vec::new();
     let mut chunk = [0; 4096];
     let split = loop {
@@ -160,13 +159,21 @@ pub fn client_request(
         format!("{address}:80")
     };
     use std::net::ToSocketAddrs;
-    let addr = host
+    let addresses = host
         .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or("No server address")?;
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
+    let mut last_error = "No reachable server address".to_string();
+    let mut connected = None;
+    for address in addresses.take(8) {
+        match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(e) => last_error = e.to_string(),
+        }
+    }
+    let mut stream = connected.ok_or(last_error)?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
