@@ -170,8 +170,22 @@ try {
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('heading', { name: 'More machines. One agent.' }).waitFor();
-  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true, 'Mobile layout should not overflow horizontally');
   await page.screenshot({ path: path.join(output, 'dashboard-mobile.png'), fullPage: true });
+  const mobileLayout = await page.evaluate(() => ({
+    viewport: innerWidth,
+    documentWidth: document.documentElement.scrollWidth,
+    overflowingElements: [...document.querySelectorAll('body *')].flatMap(element => {
+      const rect = element.getBoundingClientRect();
+      if (!rect.width || !rect.height || (rect.right <= innerWidth + 1 && rect.left >= -1)) return [];
+      const style = getComputedStyle(element);
+      return [{ tag: element.tagName, id: element.id, className: element.className, left: rect.left, right: rect.right, width: rect.width, position: style.position, overflowX: style.overflowX }];
+    }).slice(0, 80),
+  }));
+  if (mobileLayout.documentWidth > mobileLayout.viewport + 1) {
+    await writeFile(path.join(output, 'ui-overflow.json'), JSON.stringify(mobileLayout, null, 2));
+    console.error('Mobile overflow diagnostics:', JSON.stringify(mobileLayout));
+  }
+  assert.ok(mobileLayout.documentWidth <= mobileLayout.viewport + 1, 'Mobile layout should not overflow horizontally');
   assert.deepEqual(browserMessages.filter(message => message.startsWith('PAGE ERROR:')), [], 'Dashboard should not throw uncaught JavaScript errors');
   console.log('PASS: responsive dashboard and no uncaught JavaScript errors');
 } catch (error) {
@@ -193,6 +207,10 @@ try {
     } catch (diagnosticError) { browserMessages.push(`Workspace diagnostics unavailable: ${redact(diagnosticError.message)}`); }
   }
   if (page && !page.isClosed()) {
+    try {
+      const layout = await page.evaluate(() => ({ viewport: innerWidth, documentWidth: document.documentElement.scrollWidth, overflowingElements: [...document.querySelectorAll('body *')].flatMap(element => { const r = element.getBoundingClientRect(); return r.width && r.height && (r.right > innerWidth + 1 || r.left < -1) ? [{ tag: element.tagName, id: element.id, className: element.className, left: r.left, right: r.right, width: r.width }] : []; }).slice(0, 80) }));
+      await writeFile(path.join(output, 'ui-failure-layout.json'), JSON.stringify(layout, null, 2));
+    } catch (diagnosticError) { browserMessages.push(`Layout diagnostics unavailable: ${redact(diagnosticError.message)}`); }
     try { await writeFile(path.join(output, 'ui-page.txt'), redact(await page.locator('body').innerText({ timeout: 3000 }))); }
     catch (diagnosticError) { browserMessages.push(`Page diagnostics unavailable: ${redact(diagnosticError.message)}`); }
     try { await page.screenshot({ path: path.join(output, 'ui-failure.png'), fullPage: true, mask: [page.locator('#admin-token'), page.locator('#modal .secret'), page.locator('#modal .command')] }); } catch { /* Keep the original failure. */ }
