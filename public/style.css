@@ -20,3 +20,5 @@
 .network-address-row{display:flex;gap:12px;align-items:center}.network-address-row select{min-width:0;flex:1}#network-status{font-size:12px;line-height:1.7;overflow-wrap:anywhere}#master-network{margin-bottom:24px}#master-network .input-help{margin-bottom:0!important}@media(max-width:700px){#master-network .panel-head{flex-wrap:wrap;gap:12px}.network-address-row{flex-wrap:wrap}.network-address-row select{flex-basis:100%}}
 
 .snapshot-id { overflow-wrap: anywhere; word-break: break-all; }
+
+.registration{max-width:720px;margin:0 auto;padding:40px 24px}.registration>.brand{margin-bottom:28px}.registration-panel{padding:28px;margin-bottom:20px}.registration-panel h1{margin:10px 0 18px}.registration-panel h2{margin:24px 0 14px}.registration-panel p{font-size:13px;margin:14px 0}.worker .info-row strong{text-align:right;overflow-wrap:anywhere;min-width:0}.worker .info-row>span{flex-shrink:0}.worker-setup{margin-top:7px}.registration .command{max-width:100%;overflow-wrap:anywhere}@media(max-width:700px){.registration{padding:24px 16px}.registration-panel{padding:20px}.registration-panel h1{font-size:26px}}

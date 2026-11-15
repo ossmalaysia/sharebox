@@ -1,5 +1,9 @@
 'use strict';
 
+// Registration secrets live only in a URL fragment; remove it before any API work.
+const incomingRegistration = location.hash.startsWith('#pair=') ? location.hash : null;
+if (incomingRegistration !== null) history.replaceState(null, '', location.pathname + location.search);
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -11,6 +15,7 @@ let refreshing = false;
 let toastTimer;
 let selectedJobId = null;
 let modalKind = '';
+let registrationActive = incomingRegistration !== null;
 let network = { bindAddress: '', localOnly: false, urls: [] };
 let selectedLanUrl = '';
 
@@ -28,9 +33,54 @@ function relativeTime(value) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`; if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
   return new Date(time).toLocaleDateString();
 }
-function online(worker) { return !worker.revoked && Date.now() - numericTime(worker.lastSeen) < 20000; }
+function heartbeat(worker) { return worker.lastPollAt ?? worker.lastSeen; }
+function online(worker) { return !worker.revoked && numericTime(heartbeat(worker)) > 0 && Date.now() - numericTime(heartbeat(worker)) < 20000; }
+function connectionLabel(worker) { return online(worker) ? 'Online' : heartbeat(worker) === 0 ? 'Registered' : 'Offline'; }
 function statusClass(status) { return ['queued', 'running', 'cancelling', 'passed', 'failed', 'cancelled', 'lost'].includes(status) ? status : 'queued'; }
 function terminal(job) { return ['passed', 'failed', 'cancelled', 'lost'].includes(job.status); }
+function dockerStatus(worker) {
+  const docker = worker.capabilities?.docker;
+  if (typeof docker?.available !== 'boolean' || typeof docker?.ready !== 'boolean') return 'Not reported — update worker';
+  if (docker.checked === false) return online(worker) ? 'Checking Docker…' : 'Last report: check pending';
+  const state = docker.ready ? 'Ready' : docker.available ? 'Not running or unavailable' : 'Not installed';
+  return online(worker) ? state : `Last reported: ${state.toLowerCase()}`;
+}
+function executionStatus(worker) {
+  const tasks = worker.tasks || [];
+  const docker = tasks.filter(task => task.snapshot && task.execution === 'docker').length;
+  const native = tasks.length - docker;
+  return docker ? native ? 'Docker and native tasks' : 'Docker snapshot tasks' : 'Native tasks';
+}
+function setupCommand(platform) {
+  return platform === 'windows' ? '& "$env:LOCALAPPDATA\\Sharebox\\bin\\sharebox.exe" setup' : '"$HOME/.local/bin/sharebox" setup';
+}
+function setupInstructions(prefix) {
+  return `<label for="${prefix}-platform">Worker operating system</label><select id="${prefix}-platform"><option value="macos">macOS / Linux terminal</option><option value="windows">Windows PowerShell</option></select><div class="command-label"><strong>Open worker setup</strong><button class="text-btn" id="${prefix}-copy-command">Copy command</button></div><pre class="command" id="${prefix}-command"></pre><p class="input-help"><a href="https://github.com/ossmalaysia/sharebox/releases/latest" target="_blank" rel="noopener noreferrer">Install or update Sharebox</a> first if needed. Or choose <strong>Open worker setup</strong> from this worker’s Sharebox tray menu. These commands use the default installation location; custom installs can run <code>sharebox setup</code>.</p>`;
+}
+function wireSetupInstructions(prefix) {
+  const update = () => { $(`#${prefix}-command`).textContent = setupCommand($(`#${prefix}-platform`).value); };
+  $(`#${prefix}-platform`).onchange = update;
+  $(`#${prefix}-copy-command`).onclick = () => copy($(`#${prefix}-command`).textContent);
+  update();
+}
+function showRegistrationLanding(fragment) {
+  registrationActive = true;
+  clearInterval(refreshTimer);
+  $('#loading').classList.add('hidden'); $('#login').classList.add('hidden'); $('#app').classList.add('hidden');
+  const code = /^#pair=([a-f0-9]{64})$/.exec(fragment)?.[1];
+  $('#registration').classList.remove('hidden');
+  $('#registration-content').innerHTML = code
+    ? `<span class="eyebrow">Connect this machine</span><h1 id="registration-title">Your worker setup link</h1><p>This link connects a worker to <strong>${escapeHTML(location.host)}</strong>. You do not need the master’s admin token.</p><div class="alert warning">Use this private link once before it expires. Opening this page does not register the worker.</div><div class="command-label"><strong>1. Copy the registration link</strong><button class="text-btn" id="copy-registration-landing">Copy link</button></div><pre class="command" id="landing-registration-link">${escapeHTML(`${location.origin}/#pair=${code}`)}</pre><h2>2. Open Sharebox on the worker</h2>${setupInstructions('landing')}<h2>3. Paste, choose, connect</h2><p>Paste the link into worker setup, choose an allowed test task and Docker sandbox if available, then connect. Start its background service to keep the worker online.</p><p class="input-help"><a href="https://github.com/ossmalaysia/sharebox/releases/latest" target="_blank" rel="noopener noreferrer">Install or update Sharebox</a> first. Both machines need a version that supports worker setup. The worker checks compatibility and Docker readiness before enabling snapshot execution.</p>`
+    : '<span class="eyebrow">Worker setup</span><h1 id="registration-title">This registration link is invalid</h1><p>Ask the master owner to create a fresh link using <strong>Pair worker</strong>. No registration was attempted.</p>';
+  if (code) {
+    $('#copy-registration-landing').onclick = () => copy(`${location.origin}/#pair=${code}`);
+    wireSetupInstructions('landing');
+  }
+}
+function workerSetupInstructions(id) {
+  openModal(`<h2 id="modal-title">Configure ${escapeHTML(workerName(id))}</h2><p>Open setup on <strong>${escapeHTML(workerName(id))}</strong> itself. It shows connection and Docker status, lets the owner enable a sandbox task, and manages the existing background service.</p>${setupInstructions('worker-settings')}<p class="input-help">Existing task permissions and pairing are preserved. Sandbox settings are changed on the worker, not remotely by the master.</p><div class="actions"><button class="btn" data-action="close">Done</button></div>`, 'worker-settings');
+  wireSetupInstructions('worker-settings');
+}
 function workerName(id) { return workspace.workers.find(w => w.id === id)?.name || id || 'Unassigned'; }
 function shortId(id) { return String(id || '').slice(0, 12); }
 function shellQuote(value) { return `'${String(value).replace(/'/g, `'"'"'`)}'`; }
@@ -52,11 +102,14 @@ async function api(path, options = {}) {
 
 function disconnect(message = '') {
   clearInterval(refreshTimer); setToken(''); selectedJobId = null; selectedLanUrl = ''; network = { bindAddress: '', localOnly: false, urls: [] }; closeModal();
-  $('#loading').classList.add('hidden'); $('#app').classList.add('hidden'); $('#login').classList.remove('hidden');
+  $('#loading').classList.add('hidden'); $('#app').classList.add('hidden'); $('#login').classList.toggle('hidden', registrationActive);
   $('#admin-token').value = ''; showError($('#login-error'), message);
 }
 async function connect() {
+  if (registrationActive) return;
   const me = await api('/api/me');
+  if (registrationActive) return;
+  $('#master-version').textContent = me.version ? `Master v${me.version}` : 'Master version unknown';
   $('#workspace-name').textContent = me.name || 'Local workspace'; $('#master-host').textContent = location.host;
   $('#mcp-endpoint').textContent = `${location.origin}/mcp`;
   $('#loading').classList.add('hidden'); $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
@@ -89,9 +142,10 @@ async function refreshNetwork() {
 }
 
 async function refresh() {
-  if (refreshing || !adminToken) return; refreshing = true;
+  if (refreshing || !adminToken || registrationActive) return; refreshing = true;
   try {
     const result = await api('/api/workspace');
+    if (registrationActive) return;
     workspace = { workers: result.workers || [], jobs: result.jobs || [], tokens: result.tokens || [] };
     render(); showError($('#page-error'), ''); $('#connection-state').textContent = 'Connected'; $('#connection-dot').className = 'dot'; $('#connection-caption').textContent = 'Local master connected';
     $('#last-updated').textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
@@ -112,10 +166,10 @@ function render() {
   $('#stat-active').textContent = running + queued; $('#stat-active-note').textContent = `${running} running · ${queued} queued`;
   $('#stat-completed').textContent = completed; $('#stat-completed-note').textContent = `${workspace.jobs.filter(j => j.status === 'passed').length} passed · ${workspace.jobs.filter(j => j.status === 'failed').length} failed`;
   $('#worker-count').textContent = String(activeWorkers.length).padStart(2, '0');
-  $('#topology-workers').innerHTML = activeWorkers.length ? activeWorkers.slice(0, 4).map(w => `<div class="topology-node"><span class="node-symbol">${w.os === 'windows' ? '⊞' : '▱'}</span><div><strong>${escapeHTML(w.name)}</strong><small><span class="dot ${online(w) ? '' : 'offline'}"></span>${escapeHTML(w.os)} · ${online(w) ? 'Online' : 'Offline'}</small></div></div>`).join('') : '<div class="topology-empty">Pair a machine to grow your network</div>';
+  $('#topology-workers').innerHTML = activeWorkers.length ? activeWorkers.slice(0, 4).map(w => `<div class="topology-node"><span class="node-symbol">${w.os === 'windows' ? '⊞' : '▱'}</span><div><strong>${escapeHTML(w.name)}</strong><small><span class="dot ${online(w) ? '' : 'offline'}"></span>${escapeHTML(w.os)} · ${connectionLabel(w)}</small></div></div>`).join('') : '<div class="topology-empty">Pair a machine to grow your network</div>';
   $('#worker-list').innerHTML = activeWorkers.length ? activeWorkers.map(w => {
     const jobs = workspace.jobs.filter(j => j.workerId === w.id && ['running', 'cancelling'].includes(j.status));
-    return `<article class="panel worker"><div class="worker-header"><span class="worker-icon">${w.os === 'windows' ? '⊞' : w.os === 'linux' ? '◇' : '▱'}</span><span class="pill ${online(w) ? 'online' : ''}"><span class="dot ${online(w) ? '' : 'offline'}"></span>${online(w) ? 'Online' : 'Offline'}</span></div><h3>${escapeHTML(w.name)}</h3><p class="worker-meta">${escapeHTML(w.os || 'Unknown OS')} · ${escapeHTML(w.arch || 'Unknown architecture')}</p><div class="tags">${(w.tasks || []).map(t => `<span class="tag" title="${escapeHTML(t.description || '')}">${escapeHTML(t.name)}</span>`).join('') || '<span class="tag">No configured tasks</span>'}</div><div class="info-row"><span>Execution</span><strong>Owner-configured tasks</strong></div><div class="info-row"><span>Activity</span><strong>${jobs.length ? `${jobs.length} running` : 'Idle'}</strong></div><div class="info-row"><span>Last heartbeat</span><span>${escapeHTML(relativeTime(w.lastSeen))}</span></div><div class="worker-footer"><button class="btn" data-action="worker-job" data-id="${escapeHTML(w.id)}" ${!(w.tasks || []).length ? 'disabled' : ''}>Run task ↗</button><button class="text-btn danger" data-action="revoke-worker" data-id="${escapeHTML(w.id)}">Revoke access</button></div></article>`;
+    return `<article class="panel worker"><div class="worker-header"><span class="worker-icon">${w.os === 'windows' ? '⊞' : w.os === 'linux' ? '◇' : '▱'}</span><span class="pill ${online(w) ? 'online' : ''}"><span class="dot ${online(w) ? '' : 'offline'}"></span>${connectionLabel(w)}</span></div><h3>${escapeHTML(w.name)}</h3><p class="worker-meta">${escapeHTML(w.os || 'Unknown OS')} · ${escapeHTML(w.arch || 'Unknown architecture')} · Sharebox ${escapeHTML(w.capabilities?.version || 'version unknown')}</p><div class="tags">${(w.tasks || []).map(t => `<span class="tag" title="${escapeHTML(t.description || '')}">${escapeHTML(t.name)}</span>`).join('') || '<span class="tag">No configured tasks</span>'}</div><div class="info-row"><span>Execution</span><strong>${escapeHTML(executionStatus(w))}</strong></div><div class="info-row"><span>Activity</span><strong>${heartbeat(w) === 0 ? 'Waiting for service to start' : !online(w) ? 'Unknown while offline' : jobs.length ? `${jobs.length} running` : 'Idle'}</strong></div><div class="info-row"><span>Docker</span><strong class="docker-state" title="${escapeHTML(w.capabilities?.docker?.message || 'Reported by the worker')}">${escapeHTML(dockerStatus(w))}</strong></div><div class="info-row"><span>Sandbox tasks</span><strong>${(w.tasks || []).filter(t => t.snapshot && t.execution === 'docker').length ? `${(w.tasks || []).filter(t => t.snapshot && t.execution === 'docker').length} enabled` : 'Not enabled'}</strong></div><div class="info-row"><span>Last heartbeat</span><span>${escapeHTML(relativeTime(heartbeat(w)))}</span></div><button class="text-btn worker-setup" data-action="worker-setup" data-id="${escapeHTML(w.id)}">Worker setup instructions</button><div class="worker-footer"><button class="btn" data-action="worker-job" data-id="${escapeHTML(w.id)}" ${!(w.tasks || []).length ? 'disabled' : ''}>Run task ↗</button><button class="text-btn danger" data-action="revoke-worker" data-id="${escapeHTML(w.id)}">Revoke access</button></div></article>`;
   }).join('') : '<div class="empty"><span>▣</span><h3>Your first worker is one command away</h3><p>Pair a Mac, Windows, or Linux machine to make its configured tasks available to your agent.</p><button class="btn primary" data-action="pair">+ Pair a worker</button></div>';
   renderJobs();
   $('#token-list').innerHTML = workspace.tokens.length ? workspace.tokens.map(t => `<div class="token-row"><div><strong>${escapeHTML(t.name || 'MCP token')}</strong><small>Created ${escapeHTML(relativeTime(t.createdAt))} · ${escapeHTML(shortId(t.id))}</small></div><button class="text-btn danger" data-action="revoke-token" data-id="${escapeHTML(t.id)}">Revoke</button></div>`).join('') : '<p class="tokens-empty">No MCP tokens yet. Create one to connect an agent.</p>';
@@ -169,10 +223,10 @@ async function pairing(sameMachine = false) {
     const serverUrl = sameMachine ? location.origin : selectedLanUrl;
     const result = await api('/api/pairing', { method: 'POST', body: {} });
     if (modalKind !== 'pair') return;
-    const init = './sharebox init --config worker.json';
-    const command = `./sharebox worker --server ${shellQuote(serverUrl)} --code ${shellQuote(result.code)} --config worker.json`;
-    openModal(`<h2 id="modal-title">${sameMachine ? 'Pair a worker on this machine' : 'Bring another machine online'}</h2><p>Run the Sharebox binary on the target machine. Its configuration defines exactly which tasks your agent may execute.</p><div class="alert warning">Pairing code expires ${escapeHTML(new Date(numericTime(result.expiresAt)).toLocaleTimeString())}. Use it once and keep it private.</div><div class="command-label"><strong>1. Create a worker configuration</strong><button class="text-btn" id="copy-init">Copy</button></div><pre class="command">${escapeHTML(init)}</pre><p>Edit <code>worker.json</code> to select local directories and allowed tasks.</p><div class="command-label"><strong>2. Pair and start the worker</strong><button class="text-btn" id="copy-pair">Copy</button></div><pre class="command">${escapeHTML(command)}</pre><p>On Windows, use <code>.\\sharebox.exe</code> in PowerShell. The target machine must be able to reach <strong>${escapeHTML(serverUrl)}</strong>. ${sameMachine ? 'This command is for a worker on the same machine as the master.' : 'Open this URL from the worker first to check access; address detection does not verify firewall or network reachability.'}</p><div class="alert success">The worker will appear in your dashboard after it connects. Keep its terminal running.</div>${errorBox()}<div class="actions"><button class="btn" data-action="close">Done</button></div>`, 'pair');
-    $('#copy-init').onclick = () => copy(init); $('#copy-pair').onclick = () => copy(command);
+    const registrationLink = `${serverUrl}/#pair=${result.code}`;
+    openModal(`<h2 id="modal-title">${sameMachine ? 'Pair a worker on this machine' : 'Bring another machine online'}</h2><p>Copy this link to the worker, then finish setup on that machine. No configuration file editing is needed.</p><div class="alert warning">This private link expires ${escapeHTML(new Date(numericTime(result.expiresAt)).toLocaleTimeString())}. Use it once and keep it private.</div><div class="command-label"><strong>1. Copy the registration link</strong><button class="text-btn" id="copy-registration-link">Copy link</button></div><pre class="command" id="registration-link">${escapeHTML(registrationLink)}</pre><h3>2. Open setup on the worker</h3>${setupInstructions('pair-setup')}<h3>3. Choose a task and connect</h3><p>Paste the link into setup. Enable Docker sandbox if the worker reports Docker ready, then connect and start its background service.</p><p class="input-help">${sameMachine ? 'This link is for a worker on the same machine as the master.' : `The worker must be able to reach ${escapeHTML(serverUrl)}. Address detection does not verify firewall or network reachability.`}</p><div class="alert success">The worker appears here after registration. Its status changes to Online when its service is polling.</div>${errorBox()}<div class="actions"><button class="btn" data-action="close">Done</button></div>`, 'pair');
+    $('#copy-registration-link').onclick = () => copy(registrationLink);
+    wireSetupInstructions('pair-setup');
   } catch (error) { modalError(error); }
 }
 
@@ -260,6 +314,7 @@ document.addEventListener('click', event => {
   if (action === 'pair') void pairing();
   else if (action === 'new-job') delegate();
   else if (action === 'worker-job') delegate(id);
+  else if (action === 'worker-setup') workerSetupInstructions(id);
   else if (action === 'connect-mcp') connectMcp();
   else if (action === 'job-details') void jobDetails(id);
   else if (action === 'revoke-worker') confirmRevoke('worker', id);
@@ -282,4 +337,12 @@ $('#lan-address').onchange = () => { selectedLanUrl = $('#lan-address').value; }
 $('#copy-lan-address').onclick = () => { if (selectedLanUrl) void copy(selectedLanUrl); };
 $('#copy-endpoint').onclick = () => copy(`${location.origin}/mcp`);
 $$('nav a').forEach(a => a.onclick = () => { $$('nav a').forEach(n => n.classList.remove('active')); a.classList.add('active'); $('#breadcrumb').textContent = a.textContent.trim().replace(/^[^A-Za-z]+/, ''); });
-if (adminToken) connect().catch(error => disconnect(error.message)); else disconnect();
+window.addEventListener('hashchange', () => {
+  if (!location.hash.startsWith('#pair=')) return;
+  const fragment = location.hash;
+  history.replaceState(null, '', location.pathname + location.search);
+  closeModal();
+  showRegistrationLanding(fragment);
+});
+if (incomingRegistration !== null) showRegistrationLanding(incomingRegistration);
+else if (adminToken) connect().catch(error => disconnect(error.message)); else disconnect();

@@ -93,7 +93,6 @@ mod native {
     use super::*;
     use std::fs::File;
     use std::path::PathBuf;
-    #[cfg(target_os = "macos")]
     use std::process::{Command, Stdio};
     use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::time::{Duration, Instant};
@@ -108,6 +107,7 @@ mod native {
         Refresh,
         Open,
         CheckUpdates,
+        WorkerSetup,
     }
     struct Update {
         running: Option<bool>,
@@ -264,7 +264,15 @@ mod native {
             let action_result = match next_action.take() {
                 Some(Action::Start) => crate::service::service_action("start", &role),
                 Some(Action::Stop) => crate::service::service_action("stop", &role),
+                Some(Action::Open) if role == "worker" => {
+                    crate::service::worker_registration_config().and_then(|path| {
+                        let path = path.ok_or("Worker service is not registered")?;
+                        let config = crate::worker::load_config(&path)?;
+                        open_dashboard(&config.server)
+                    })
+                }
                 Some(Action::Open) => open_dashboard(&dashboard),
+                Some(Action::WorkerSetup) => open_worker_setup(),
                 _ => Ok(()),
             };
             let status = crate::service::is_running(&role);
@@ -291,6 +299,27 @@ mod native {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    fn open_worker_setup() -> Result<()> {
+        let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+        command
+            .arg("setup")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Open worker setup: {e}"))?;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -462,6 +491,7 @@ mod native {
             None,
         );
         let open = MenuItem::new("Open dashboard", !options.check, None);
+        let setup = MenuItem::new("Worker setup & status…", !options.check, None);
         let start = MenuItem::new("Start service", false, None);
         let stop = MenuItem::new("Stop service (cancel jobs first)", false, None);
         let refresh = MenuItem::new("Refresh status", !options.check, None);
@@ -477,6 +507,7 @@ mod native {
             &status,
             &PredefinedMenuItem::separator(),
             &open,
+            &setup,
             &start,
             &stop,
             &refresh,
@@ -536,6 +567,8 @@ mod native {
                     Action::Stop
                 } else if event.id == *open.id() {
                     Action::Open
+                } else if event.id == *setup.id() {
+                    Action::WorkerSetup
                 } else if event.id == *check_updates.id() {
                     Action::CheckUpdates
                 } else if event.id == *refresh.id() {

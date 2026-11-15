@@ -111,10 +111,15 @@ try {
   assert.equal(await page.locator('#modal .command').count(), 0, 'No unusable remote pairing command should be offered');
   await page.getByRole('button', { name: 'Pair on this machine only' }).click();
   await page.getByRole('heading', { name: 'Pair a worker on this machine', exact: true }).waitFor();
-  const localCommands = await page.locator('#modal .command').allTextContents();
-  assert.ok(localCommands.some(command => command.includes(`--server '${origin}'`)));
-  const localCode = localCommands.join(' ').match(/--code\s+'([^']+)'/)?.[1];
-  if (localCode) sensitive.add(localCode);
+  const localLink = await page.locator('#registration-link').innerText();
+  assert.ok(localLink.startsWith(`${origin}/#pair=`));
+  const localCode = new URL(localLink).hash.slice('#pair='.length);
+  assert.match(localCode, /^[a-f0-9]{64}$/);
+  sensitive.add(localCode);
+  assert.equal(await page.locator('#pair-setup-command').innerText(), '"$HOME/.local/bin/sharebox" setup');
+  await page.getByLabel('Worker operating system').selectOption('windows');
+  assert.equal(await page.locator('#pair-setup-command').innerText(), '& "$env:LOCALAPPDATA\\Sharebox\\bin\\sharebox.exe" setup');
+  await page.screenshot({ path: path.join(output, 'worker-registration.png'), fullPage: true, mask: [page.locator('#registration-link')] });
   await page.getByRole('button', { name: 'Done', exact: true }).click();
 
   // Deterministic adapter fixtures test selection without assuming the CI host has a LAN.
@@ -139,15 +144,52 @@ try {
 
   await page.locator('#workers').getByRole('button', { name: '+ Pair worker', exact: true }).click();
   await page.getByRole('heading', { name: 'Bring another machine online' }).waitFor();
-  const commands = await page.locator('#modal .command').allTextContents();
-  const pairingCommand = commands.find(command => command.includes(' worker '));
-  assert.ok(pairingCommand, 'Pairing dialog should display a worker command');
-  const code = pairingCommand.match(/--code\s+'([^']+)'/)?.[1];
-  assert.ok(code, 'Worker command should contain a one-time pairing code');
-  assert.ok(pairingCommand.includes(lanUrl), 'Remote pairing command must use the selected LAN address even when the dashboard is localhost');
-  assert.ok(!pairingCommand.includes(origin), 'Do not advertise loopback to a remote worker');
+  const registrationLink = await page.locator('#registration-link').innerText();
+  const code = new URL(registrationLink).hash.slice('#pair='.length);
+  assert.match(code, /^[a-f0-9]{64}$/, 'Registration link should contain a one-time code in its fragment');
+  assert.ok(registrationLink.startsWith(`${lanUrl}/#pair=`), 'Registration must use the selected LAN address');
+  assert.ok(!registrationLink.includes(origin), 'Do not advertise loopback to a remote worker');
   sensitive.add(code);
+  await page.getByRole('button', { name: 'Copy link', exact: true }).click();
+  assert.equal(await page.evaluate(() => window.copiedLanUrl), registrationLink);
   await page.getByRole('button', { name: 'Done', exact: true }).click();
+
+  // An unauthenticated worker owner opens the link without receiving admin access.
+  const registrationContext = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const registrationPage = await registrationContext.newPage();
+  const registrationRequests = [];
+  registrationPage.on('request', request => registrationRequests.push(request.url()));
+  await registrationPage.goto(localLink, { waitUntil: 'domcontentloaded' });
+  await registrationPage.getByRole('heading', { name: 'Your worker setup link', exact: true }).waitFor();
+  assert.equal(new URL(registrationPage.url()).hash, '', 'Remove pairing code from browser address/history immediately');
+  assert.equal(await registrationPage.locator('#login').isVisible(), false, 'No admin token needed to read setup instructions');
+  assert.equal(await registrationPage.locator('#landing-registration-link').innerText(), localLink);
+  assert.ok(registrationRequests.every(url => !url.includes(localCode) && !url.includes('pair=')), 'The fragment must not appear in HTTP requests');
+  assert.ok(registrationRequests.every(url => !url.includes('/api/')), 'Opening a registration link must not register or authenticate');
+  assert.ok(await registrationPage.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Registration instructions should fit a mobile screen');
+  await registrationPage.screenshot({ path: path.join(output, 'worker-registration-landing.png'), fullPage: true, mask: [registrationPage.locator('#landing-registration-link')] });
+  await registrationPage.goto(`${origin}/#pair=invalid`, { waitUntil: 'domcontentloaded' });
+  await registrationPage.getByRole('heading', { name: 'This registration link is invalid', exact: true }).waitFor();
+  assert.equal(new URL(registrationPage.url()).hash, '');
+  await registrationContext.close();
+  console.log('PASS: private registration link, platform setup command, no-admin landing and fragment cleanup');
+
+  // A real legacy-protocol registration reports no runtime capability and has not polled.
+  const legacyResponse = await fetch(`${origin}/api/worker/pair`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: localCode, name: 'Legacy protocol fixture', os: 'linux', arch: 'x86_64', tasks: [{ name: 'test', description: 'Unstarted protocol fixture' }] }),
+  });
+  assert.equal(legacyResponse.status, 201, 'Opening a link must leave its one-time code unused');
+  const legacy = await legacyResponse.json();
+  sensitive.add(legacy.token);
+  const legacyCard = page.locator('#worker-list article').filter({ has: page.getByRole('heading', { name: 'Legacy protocol fixture', exact: true }) });
+  await legacyCard.getByText('Registered', { exact: true }).waitFor();
+  await legacyCard.getByText('Waiting for service to start', { exact: true }).waitFor();
+  await legacyCard.getByText('Not reported — update worker', { exact: true }).waitFor();
+  const legacyRevoke = await fetch(`${origin}/api/workers/${legacy.workerId}/revoke`, { method: 'POST', headers: { Authorization: `Bearer ${admin}`, 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal(legacyRevoke.status, 200);
+  await legacyCard.waitFor({ state: 'detached' });
+  console.log('PASS: registration alone is not Online and legacy Docker capability is explicitly unknown');
 
   const configPath = path.join(temporary, 'worker.json');
   const initializer = start('init', ['init', '--config', configPath]);
@@ -163,7 +205,23 @@ try {
   await workerCard.getByText('Online', { exact: true }).waitFor({ timeout: 30_000 });
   assert.equal(worker.child.exitCode, null, 'Worker should remain running');
   sensitive.add(JSON.parse(await readFile(configPath, 'utf8')).token);
-  console.log('PASS: UI-generated code pairs a real Rust worker');
+  const reportedWorker = await until(async () => {
+    const state = await (await fetch(`${origin}/api/workspace`, { headers: { Authorization: `Bearer ${admin}` } })).json();
+    const worker = state.workers.find(item => item.name === 'UI test worker');
+    return worker?.capabilities?.docker?.checked === true ? worker : null;
+  }, 'real worker Docker probe');
+  const masterHealth = await (await fetch(`${origin}/health`)).json();
+  assert.equal(reportedWorker.capabilities.version, masterHealth.version);
+  assert.equal(typeof reportedWorker.capabilities.docker.available, 'boolean');
+  assert.equal(typeof reportedWorker.capabilities.docker.ready, 'boolean');
+  await workerCard.locator('.worker-meta').filter({ hasText: `Sharebox ${masterHealth.version}` }).waitFor();
+  const expectedDocker = reportedWorker.capabilities.docker.ready ? 'Ready' : reportedWorker.capabilities.docker.available ? 'Not running or unavailable' : 'Not installed';
+  await workerCard.locator('.docker-state').filter({ hasText: expectedDocker }).waitFor();
+  await workerCard.locator('.info-row').filter({ hasText: 'Sandbox tasks' }).getByText('Not enabled', { exact: true }).waitFor();
+  await workerCard.getByRole('button', { name: 'Worker setup instructions', exact: true }).click();
+  await page.getByRole('heading', { name: 'Configure UI test worker', exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
+  console.log('PASS: UI-generated code pairs a real Rust worker and shows its reported version/Docker capability');
 
   await workerCard.getByRole('button', { name: 'Run task' }).click();
   await page.getByRole('heading', { name: 'Delegate a task', exact: true }).waitFor();
@@ -287,6 +345,10 @@ try {
     console.error('Mobile overflow diagnostics:', JSON.stringify(mobileLayout));
   }
   assert.ok(mobileLayout.documentWidth <= mobileLayout.viewport + 1, 'Mobile layout should not overflow horizontally');
+  await stop(worker.child);
+  await workerCard.getByText('Offline', { exact: true }).waitFor({ timeout: 30_000 });
+  await workerCard.getByText('Unknown while offline', { exact: true }).waitFor();
+  assert.match(await workerCard.locator('.docker-state').innerText(), /^Last reported:/, 'Offline capability is explicitly stale');
   assert.deepEqual(browserMessages.filter(message => message.startsWith('PAGE ERROR:')), [], 'Dashboard should not throw uncaught JavaScript errors');
   console.log('PASS: responsive dashboard and no uncaught JavaScript errors');
 } catch (error) {
@@ -314,7 +376,7 @@ try {
     } catch (diagnosticError) { browserMessages.push(`Layout diagnostics unavailable: ${redact(diagnosticError.message)}`); }
     try { await writeFile(path.join(output, 'ui-page.txt'), redact(await page.locator('body').innerText({ timeout: 3000 }))); }
     catch (diagnosticError) { browserMessages.push(`Page diagnostics unavailable: ${redact(diagnosticError.message)}`); }
-    try { await page.screenshot({ path: path.join(output, 'ui-failure.png'), fullPage: true, mask: [page.locator('#admin-token'), page.locator('#modal .secret'), page.locator('#modal .command'), page.locator('.clipboard-fallback')] }); } catch { /* Keep the original failure. */ }
+    try { await page.screenshot({ path: path.join(output, 'ui-failure.png'), fullPage: true, mask: [page.locator('#admin-token'), page.locator('#modal .secret'), page.locator('#modal .command'), page.locator('#landing-registration-link'), page.locator('.clipboard-fallback')] }); } catch { /* Keep the original failure. */ }
   }
 } finally {
   if (browser) await browser.close().catch(() => {});

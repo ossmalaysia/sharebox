@@ -80,6 +80,8 @@ pub struct Config {
     #[serde(default = "default_poll")]
     pub poll_seconds: u64,
     pub tasks: BTreeMap<String, Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_preset: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,7 +167,7 @@ fn capture<R: Read>(mut stream: R, logs: Arc<Mutex<Logs>>) {
         }
     }
 }
-fn private_write(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn private_write(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
@@ -212,7 +214,7 @@ pub(crate) fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
         Ok(())
     }
 }
-fn validate(config: &mut Config) -> Result<()> {
+pub(crate) fn validate(config: &mut Config) -> Result<()> {
     if !config.server.starts_with("http://")
         || config.server[7..].is_empty()
         || config.server[7..]
@@ -256,7 +258,7 @@ fn validate(config: &mut Config) -> Result<()> {
     }
     Ok(())
 }
-fn descriptors(config: &Config) -> Vec<Value> {
+pub(crate) fn descriptors(config: &Config) -> Vec<Value> {
     config
         .tasks
         .iter()
@@ -298,7 +300,7 @@ impl Connection {
     fn poll(&self, running: Option<&str>) -> Result<Poll> {
         serde_json::from_value(self.post(
             "/api/worker/poll",
-            &json!({"runningJobId":running,"tasks":descriptors(&self.config)}),
+            &json!({"runningJobId":running,"tasks":descriptors(&self.config),"capabilities":crate::setup::capabilities()}),
         )?)
         .map_err(error)
     }
@@ -1417,6 +1419,7 @@ pub fn init(path: PathBuf) -> Result<()> {
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| format!("{}-worker", std::env::consts::OS)),
         poll_seconds: 3,
+        setup_preset: None,
         tasks: BTreeMap::from([(
             "node-smoke".into(),
             Task {
@@ -1433,14 +1436,139 @@ pub fn init(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Read a bounded owner configuration without exposing credentials in diagnostics.
+pub(crate) fn load_config(path: &Path) -> Result<Config> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "Cannot open worker configuration")?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(error)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("Worker configuration exceeds 1 MiB".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "Invalid worker configuration".into())
+}
+
+/// Pair and durably save credentials without polling or executing any task.
+pub(crate) fn pair_config(path: &Path, mut config: Config, code: &str) -> Result<Config> {
+    validate(&mut config)?;
+    let mut connection = Connection {
+        config,
+        #[cfg(test)]
+        mock: None,
+    };
+    let response = connection.post("/api/worker/pair", &json!({"code":code,"name":connection.config.name,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"tasks":descriptors(&connection.config),"capabilities":crate::setup::capabilities()}))?;
+    connection.config.token = response
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing pairing token")?
+        .into();
+    connection.config.worker_id = response
+        .get("workerId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing worker ID")?
+        .into();
+    let state_path = PathBuf::from(format!("{}.pending.json", path.display()));
+    if state_path.exists() {
+        let archive = PathBuf::from(format!(
+            "{}.archived-{}.json",
+            state_path.display(),
+            nonce()
+        ));
+        std::fs::rename(&state_path, archive).map_err(error)?;
+    }
+    private_write(
+        path,
+        &serde_json::to_vec_pretty(&connection.config).map_err(error)?,
+    )?;
+    Ok(connection.config)
+}
+
+pub(crate) struct ConfigLock(std::fs::File);
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = &self.0;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+fn try_config_lock(path: &Path) -> Result<Option<ConfigLock>> {
+    let resolved = if path.exists() {
+        path.canonicalize().map_err(error)?
+    } else {
+        path.to_path_buf()
+    };
+    let path = resolved.as_path();
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(error)?;
+    let parent = parent.canonicalize().map_err(error)?;
+    let name = path
+        .file_name()
+        .ok_or("Worker configuration needs a filename")?;
+    let lock = parent.join(format!("{}.worker.lock", name.to_string_lossy()));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let file = match options.open(lock) {
+        Ok(file) => file,
+        Err(e) => {
+            #[cfg(windows)]
+            if e.raw_os_error() == Some(32) {
+                return Ok(None);
+            }
+            return Err(format!("Open worker process lock: {e}"));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            return if e.kind() == std::io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(e.to_string())
+            };
+        }
+    }
+    Ok(Some(ConfigLock(file)))
+}
+pub(crate) fn config_running(path: &Path) -> Result<bool> {
+    if !path.parent().unwrap_or(Path::new(".")).exists() {
+        return Ok(false);
+    }
+    Ok(try_config_lock(path)?.is_none())
+}
+
 /// Pair if requested, then execute the owner's task allowlist on the trusted LAN.
 pub fn run(server: Option<String>, code: Option<String>, config_path: PathBuf) -> Result<()> {
+    let _process_lock = try_config_lock(&config_path)?
+        .ok_or("This worker configuration is already running; stop the existing worker first")?;
     install_shutdown();
     if !config_path.exists() {
         init(config_path.clone())?;
     }
-    let mut config: Config =
-        serde_json::from_slice(&std::fs::read(&config_path).map_err(error)?).map_err(error)?;
+    let mut config = load_config(&config_path)?;
     if let Some(server) = server {
         config.server = server;
     }
@@ -1452,35 +1580,7 @@ pub fn run(server: Option<String>, code: Option<String>, config_path: PathBuf) -
     };
     let state_path = PathBuf::from(format!("{}.pending.json", config_path.display()));
     if let Some(code) = code {
-        let response=connection.post("/api/worker/pair",&json!({"code":code,"name":connection.config.name,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"tasks":descriptors(&connection.config)}))?;
-        connection.config.token = response
-            .get("token")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or("missing pairing token")?
-            .into();
-        connection.config.worker_id = response
-            .get("workerId")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or("missing worker ID")?
-            .into();
-        if state_path.exists() {
-            let archive = PathBuf::from(format!(
-                "{}.archived-{}.json",
-                state_path.display(),
-                nonce()
-            ));
-            std::fs::rename(&state_path, &archive).map_err(error)?;
-            eprintln!(
-                "Previous worker pending results archived at {} (new pairing has a new identity).",
-                archive.display()
-            );
-        }
-        private_write(
-            &config_path,
-            &serde_json::to_vec_pretty(&connection.config).map_err(error)?,
-        )?;
+        connection.config = pair_config(&config_path, connection.config, &code)?;
         println!("Paired worker {}.", connection.config.worker_id);
     }
     if connection.config.token.is_empty() || connection.config.worker_id.is_empty() {
@@ -1530,6 +1630,24 @@ mod tests {
         let p = std::env::temp_dir().join(format!("sharebox-test-{}", nonce()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+    #[test]
+    fn worker_configuration_cannot_run_twice() {
+        let d = dir();
+        let path = d.join("worker.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let held = try_config_lock(&path).unwrap().unwrap();
+        assert!(config_running(&path).unwrap());
+        assert!(try_config_lock(&path).unwrap().is_none());
+        #[cfg(unix)]
+        {
+            let alias = d.join("alias.json");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            assert!(config_running(&alias).unwrap());
+        }
+        drop(held);
+        assert!(!config_running(&path).unwrap());
+        std::fs::remove_dir_all(d).unwrap();
     }
     #[test]
     fn log_limit_is_total_not_per_chunk() {
@@ -1619,6 +1737,7 @@ mod tests {
                 worker_id: "test-worker".into(),
                 name: "Test".into(),
                 poll_seconds: 1,
+                setup_preset: None,
                 tasks: BTreeMap::from([(
                     "test".into(),
                     Task {
