@@ -90,6 +90,15 @@ def main():
 
             origin, token = wait_for(setup_address, "loopback setup address")
             assert setup.poll() is None
+            # Delay the request after accept, then split its headers across reads.
+            # Windows inherits nonblocking sockets from the setup listener unless
+            # the server explicitly resets them before its bounded HTTP reader.
+            with socket.create_connection(("127.0.0.1", int(origin.rsplit(":", 1)[1])), timeout=5) as connection:
+                time.sleep(.3)
+                connection.sendall(b"GET /api/setup/status HTTP/1.1\r\n")
+                time.sleep(.3)
+                connection.sendall(("Host: " + origin[7:] + "\r\nConnection: close\r\n\r\n").encode())
+                assert connection.recv(4096).startswith(b"HTTP/1.1 401")
             mutation_headers = {"Origin": origin}
 
             def local(path, data=None, expected=(200,), headers=None):

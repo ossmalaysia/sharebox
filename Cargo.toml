@@ -1,6 +1,6 @@
 [package]
 name = "sharebox"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Local network task runner with a dashboard and MCP endpoint"
 license = "MIT"

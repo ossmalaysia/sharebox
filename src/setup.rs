@@ -927,6 +927,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
         if !stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback()) {
             continue;
         }
+        // Windows accepted sockets inherit the listener's nonblocking mode.
+        // The bounded HTTP reader uses blocking I/O with per-read deadlines.
+        stream.set_nonblocking(false).map_err(|e| e.to_string())?;
         let response = match crate::http::read_request(&mut stream) {
             Ok(req) => {
                 if req.headers.get("authorization") == Some(&format!("Bearer {}", setup.token)) {
