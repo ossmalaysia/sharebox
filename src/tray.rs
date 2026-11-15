@@ -416,10 +416,8 @@ mod native {
     #[cfg(windows)]
     impl EventLoop {
         fn new() -> Result<Self> {
-            // Detach only this process, never hide the user's terminal window.
-            unsafe {
-                windows_sys::Win32::System::Console::FreeConsole();
-            }
+            // Scheduled Tasks already launch a hidden host. Stay attached so
+            // stopping that task also terminates this companion and releases its lock.
             Ok(Self)
         }
         fn pump(&self) -> bool {
