@@ -256,12 +256,16 @@ fn bounded_output(program: &str, args: &[&str]) -> Result<std::process::Output> 
     let stderr = child.stderr.take().ok_or("Missing service stderr")?;
     let out = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.take(16384).read_to_end(&mut bytes);
+        let mut stream = stdout;
+        let _ = stream.by_ref().take(16384).read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
         bytes
     });
     let err = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stderr.take(16384).read_to_end(&mut bytes);
+        let mut stream = stderr;
+        let _ = stream.by_ref().take(16384).read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
         bytes
     });
     let deadline = Instant::now() + Duration::from_secs(15);

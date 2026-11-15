@@ -77,7 +77,7 @@ jobs:
         if: runner.os != 'Linux'
         env:
           SHAREBOX_TEST_UPDATE_BINARY: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}
-        run: cargo +stable test --locked --bin sharebox updater::tests::native_helper_launcher -- --ignored --exact
+        run: cargo +stable test --locked --bin sharebox updater::tests::native_helper_launcher -- --ignored --exact --nocapture
       - name: Check PowerShell installer syntax
         if: runner.os == 'Windows'
         shell: pwsh
