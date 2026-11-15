@@ -68,6 +68,11 @@ jobs:
         env:
           SHAREBOX_BIN: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}
         run: python tests/service.py
+      - name: Exercise desktop updater validation, restart, and rollback
+        if: runner.os != 'Linux'
+        env:
+          SHAREBOX_BIN: target/debug/sharebox${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: python tests/update.py
       - name: Check PowerShell installer syntax
         if: runner.os == 'Windows'
         shell: pwsh
