@@ -852,7 +852,7 @@ pub fn cleanup_launcher_test(helper: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let needle = format!("& {} ", ps(&path_text(helper)?));
-        let script=format!("$ErrorActionPreference='Stop'; $name='Sharebox-update-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $t -and @($t.Actions).Count -eq 1 -and $t.Actions[0].Arguments.Contains({})) {{ Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue }}",ps(&needle));
+        let script=format!("$ErrorActionPreference='Stop'; $name='Sharebox-update-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $t -and @($t.Actions).Count -eq 1 -and $t.Actions[0].Arguments.Contains({})) {{ Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue }}; $remaining=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $remaining -and @($remaining.Actions).Count -eq 1 -and $remaining.Actions[0].Arguments.Contains({})) {{ throw 'Updater test registration was not removed' }}; exit 0",ps(&needle),ps(&needle));
         command(
             "powershell.exe",
             &[
