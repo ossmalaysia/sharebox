@@ -422,7 +422,10 @@ fn apply(plan_path: &Path) -> Result<()> {
     }
     #[cfg(any(windows, target_os = "macos"))]
     {
-        let helper = std::env::current_exe().map_err(|e| e.to_string())?;
+        let helper = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
         let dir = helper.parent().ok_or("Helper has no directory")?;
         if dir.file_name() != Some(std::ffi::OsStr::new(".sharebox-update"))
             || plan_path.canonicalize().map_err(|e| e.to_string())? != dir.join("plan.json")
