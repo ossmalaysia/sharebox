@@ -802,6 +802,66 @@ pub fn cleanup_update_helper() -> Result<()> {
     )
 }
 
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub fn update_launcher_test_available() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let domain = format!("gui/{}", unsafe { libc::geteuid() });
+        if !bounded_output("launchctl", &["print", &domain])?
+            .status
+            .success()
+        {
+            return Ok(false);
+        }
+        let label = format!("{domain}/org.ossmalaysia.sharebox.update.{}", unsafe {
+            libc::geteuid()
+        });
+        Ok(!bounded_output("launchctl", &["print", &label])?
+            .status
+            .success())
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").map_err(|_| "USERNAME is missing")?;
+        if !bounded_output("quser.exe", &[&user])?.status.success() {
+            return Ok(false);
+        }
+        Ok(!registered("update")?)
+    }
+}
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub fn cleanup_launcher_test(helper: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let label = format!("org.ossmalaysia.sharebox.update.{}", unsafe {
+            libc::geteuid()
+        });
+        let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, label);
+        let out = bounded_output("launchctl", &["print", &target])?;
+        if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains(&path_text(helper)?)
+        {
+            command("launchctl", &["remove", &label])?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let needle = format!("& {} ", ps(&path_text(helper)?));
+        let script=format!("$ErrorActionPreference='Stop'; $name='Sharebox-update-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $t -and @($t.Actions).Count -eq 1 -and $t.Actions[0].Arguments.Contains({})) {{ Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue }}",ps(&needle));
+        command(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

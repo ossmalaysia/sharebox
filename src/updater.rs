@@ -326,6 +326,52 @@ fn stage_dir(target: &Path) -> Result<PathBuf> {
         .join(".sharebox-update"))
 }
 
+struct UpdateLock {
+    _file: File,
+}
+#[cfg(unix)]
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Release explicitly: a concurrently spawned child can briefly inherit
+        // the open file description before CLOEXEC closes its copy.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+impl UpdateLock {
+    fn acquire(target: &Path) -> Result<Self> {
+        let path = target
+            .parent()
+            .ok_or("Missing executable parent")?
+            .join(".sharebox-update.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|e| format!("Another update operation may be active: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err("Another update operation is active".into());
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 pub fn install(release: &Release) -> Result<()> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -340,11 +386,12 @@ pub fn install(release: &Release) -> Result<()> {
         {
             return Err("Update must be a newer stable release".into());
         }
-        cleanup_completed()?;
         let target = std::env::current_exe()
             .map_err(|e| e.to_string())?
             .canonicalize()
             .map_err(|e| e.to_string())?;
+        let _lock = UpdateLock::acquire(&target)?;
+        cleanup_completed_inner(&target)?;
         let dir = stage_dir(&target)?;
         private_directory(&dir).map_err(|e| format!("Another update may be in progress. {e}"))?;
         let prepared = (|| {
@@ -596,14 +643,26 @@ fn rollback(target: &Path, backup: &Path) -> Result<()> {
 /// Called during tray startup. Only completed update staging is removed.
 pub fn cleanup_completed() -> Result<()> {
     let target = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = stage_dir(&target)?;
+    let _lock = UpdateLock::acquire(&target)?;
+    cleanup_completed_inner(&target)
+}
+fn cleanup_completed_inner(target: &Path) -> Result<()> {
+    let dir = stage_dir(target)?;
     if dir.join("complete").is_file() {
+        if fs::symlink_metadata(&dir)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("Update staging directory must not be a symlink".into());
+        }
         for _ in 0..20 {
             if fs::remove_dir_all(&dir).is_ok() {
-                break;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        return Err("Completed updater is still exiting; retry shortly".into());
     }
     Ok(())
 }
@@ -630,6 +689,77 @@ mod tests {
         command.arg("--help");
         assert!(process_to_file(command, &output, 1, 5).is_err());
         assert!(fs::metadata(output).unwrap().len() <= 2);
+    }
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    #[ignore = "requires a built application and interactive service manager"]
+    fn native_helper_launcher() {
+        let Some(binary) = std::env::var_os("SHAREBOX_TEST_UPDATE_BINARY") else {
+            eprintln!("SKIP: SHAREBOX_TEST_UPDATE_BINARY is unset");
+            return;
+        };
+        match crate::service::update_launcher_test_available() {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("SKIP: no interactive service manager or an updater already exists");
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP: cannot inspect service manager: {e}");
+                return;
+            }
+        }
+        let t =
+            Temp(std::env::temp_dir().join(format!("sharebox-launcher-test-{}", nonce().unwrap())));
+        private_directory(&t.0).unwrap();
+        let root = t.0.canonicalize().unwrap();
+        let stage = root.join(".sharebox-update");
+        private_directory(&stage).unwrap();
+        let helper = stage.join(if cfg!(windows) {
+            "helper.exe"
+        } else {
+            "helper"
+        });
+        fs::copy(PathBuf::from(binary).canonicalize().unwrap(), &helper).unwrap();
+        let plan = stage.join("plan.json");
+        write(&plan, b"{").unwrap();
+        let launch = crate::service::launch_update_helper(&helper, &plan);
+        if let Err(e) = launch {
+            let _ = crate::service::cleanup_launcher_test(&helper);
+            panic!("Launch independent helper: {e}");
+        }
+        let outcome = root.join(".sharebox-update-result");
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !stage.join("complete").is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The invalid plan is rejected before any service state is read or changed.
+        let result = fs::read_to_string(&outcome);
+        std::thread::sleep(Duration::from_secs(1));
+        crate::service::cleanup_launcher_test(&helper).unwrap();
+        let message = result.expect("Independent helper did not persist a result");
+        assert!(message.contains("Invalid update plan"), "{message}");
+        assert!(stage.join("complete").is_file());
+        for _ in 0..20 {
+            if fs::remove_dir_all(&stage).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !stage.exists(),
+            "Launcher test left a locked staging directory"
+        );
+    }
+    #[test]
+    fn update_lock_serializes_cleanup_and_new_install() {
+        let t = Temp(std::env::temp_dir().join(format!("sharebox-lock-test-{}", nonce().unwrap())));
+        private_directory(&t.0).unwrap();
+        let target = t.0.join("sharebox");
+        let held = UpdateLock::acquire(&target).unwrap();
+        assert!(UpdateLock::acquire(&target).is_err());
+        drop(held);
+        assert!(UpdateLock::acquire(&target).is_ok());
     }
     #[test]
     fn stable_versions_only() {
