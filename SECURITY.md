@@ -27,3 +27,13 @@ Snapshot execution is an explicit worker-owner opt-in. An uploaded test or packa
 Docker mode mounts input read-only and copies it into a size-limited temporary workspace; it does not give the container a writable host checkout, host credentials, or Docker socket. The Docker daemon and owner-selected image remain trusted dependencies. Network access defaults off; enabling bridge networking is not an egress allowlist. Images should be pinned and scanned separately.
 
 Uploads are bounded and principal-scoped, and workers download only input assigned to an active job. File paths, content hashes, and credential-shaped configuration are validated. Default exclusions reduce accidental disclosure but do not guarantee that source files contain no hardcoded secrets. Snapshot transfer still uses HTTP on the trusted LAN. See [snapshot design](docs/source-snapshots.md) and the snapshot security review for implementation and validation details.
+
+## Desktop release updater
+
+The Windows/macOS tray checks the official `ossmalaysia/sharebox` GitHub repository for a newer stable release. Checks are outbound HTTPS requests; they do not send Sharebox tokens, source files, worker configuration, or job logs. GitHub and its download infrastructure still receive ordinary connection metadata such as the client's IP address.
+
+Installing an update requires an explicit local confirmation. The update is downloaded and checked before services stop. Replacing the shared executable may interrupt running tasks on both roles, so finish or cancel those tasks first. This feature does not authorize a remote MCP client to replace binaries, alter task permissions, or choose an update URL.
+
+The updater verifies the native archive against the same release's SHA-256 manifest before extracting the executable. HTTPS and checksums protect transport integrity and archive selection; they are not independent release signatures and do not protect against a compromised publisher account or release pipeline. The native binaries remain unsigned/unnotarized. Existing same-account code can already modify user-owned binaries and service configuration; the updater is not a privilege boundary against that account.
+
+The helper runs without elevation and preserves existing service registrations and data/configuration paths. Configuration and credentials are not part of the replacement payload. Keep backups of important master state independently of executable updates.

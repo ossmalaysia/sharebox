@@ -256,12 +256,16 @@ fn bounded_output(program: &str, args: &[&str]) -> Result<std::process::Output> 
     let stderr = child.stderr.take().ok_or("Missing service stderr")?;
     let out = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.take(16384).read_to_end(&mut bytes);
+        let mut stream = stdout;
+        let _ = stream.by_ref().take(16384).read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
         bytes
     });
     let err = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stderr.take(16384).read_to_end(&mut bytes);
+        let mut stream = stderr;
+        let _ = stream.by_ref().take(16384).read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
         bytes
     });
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -612,6 +616,254 @@ fn platform(action: &str, role: &str, spec: Option<&Spec>) -> Result<()> {
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn platform(_: &str, _: &str, _: Option<&Spec>) -> Result<()> {
     Err("Service mode supports Windows, macOS, and Linux only".into())
+}
+
+#[cfg(target_os = "macos")]
+fn update_registration_matches(role: &str, target: &Path) -> Result<bool> {
+    let file = home()?
+        .join("Library/LaunchAgents")
+        .join(format!("org.ossmalaysia.sharebox.{role}.plist"));
+    if !file.is_file() {
+        return Ok(false);
+    }
+    let output = bounded_output(
+        "/usr/bin/plutil",
+        &["-convert", "json", "-o", "-", &path_text(&file)?],
+    )?;
+    if !output.status.success() {
+        return Err("Cannot inspect registered executable".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| "Invalid service registration")?;
+    let exe = value
+        .get("ProgramArguments")
+        .and_then(|a| a.get(0))
+        .and_then(|x| x.as_str())
+        .ok_or("Service registration has no executable")?;
+    Ok(Path::new(exe).canonicalize().map_err(|e| e.to_string())? == target)
+}
+#[cfg(windows)]
+fn update_registration_matches(role: &str, target: &Path) -> Result<bool> {
+    let needle = format!("& {} ", ps(&path_text(target)?));
+    // Registrations produced by this executable use exactly one PowerShell action.
+    // Canonical Windows paths may carry a verbatim prefix absent from older tasks.
+    let plain = target
+        .to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .to_owned();
+    let other = format!("& {} ", ps(&plain));
+    let script=format!("$ErrorActionPreference='Stop'; $name={}+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name; $a=@($t.Actions); if ($a.Count -eq 1 -and ($a[0].Arguments.Contains({}) -or $a[0].Arguments.Contains({}))) {{ 'yes' }} else {{ 'no' }}",ps(&format!("Sharebox-{}-",role.replace('.',"-"))),ps(&needle),ps(&other));
+    let output = bounded_output(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err("Cannot inspect registered executable".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "yes")
+}
+
+/// The updater leaves registrations untouched and restores only previously loaded roles.
+#[cfg(any(windows, target_os = "macos"))]
+pub fn update_service_states(target: &Path) -> Result<Vec<String>> {
+    let mut roles = Vec::new();
+    for role in ["master", "worker", "tray.master", "tray.worker"] {
+        if running_native(role)? && update_registration_matches(role, target)? {
+            roles.push(role.into());
+        }
+    }
+    Ok(roles)
+}
+#[cfg(any(windows, target_os = "macos"))]
+pub fn stop_for_update(roles: &[String]) -> Result<()> {
+    for role in roles.iter().rev() {
+        if loaded(role)? {
+            platform("stop", role, None)?;
+        }
+    }
+    for _ in 0..8 {
+        let mut any = false;
+        for role in roles {
+            any |= running_native(role)?;
+        }
+        if !any {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err("Timed out waiting for Sharebox services to stop".into())
+}
+#[cfg(any(windows, target_os = "macos"))]
+pub fn restore_after_update(roles: &[String]) -> Result<()> {
+    for role in roles {
+        if !running_native(role)? {
+            platform("start", role, None)?;
+        }
+    }
+    let mut consecutive = 0;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let mut all = true;
+        for role in roles {
+            all &= running_native(role)?;
+        }
+        consecutive = if all { consecutive + 1 } else { 0 };
+        if consecutive >= 3 {
+            return Ok(());
+        }
+    }
+    Err("Updated services did not stay running after restart".into())
+}
+#[cfg(target_os = "macos")]
+pub fn launch_update_helper(helper: &Path, plan: &Path) -> Result<()> {
+    let label = format!("org.ossmalaysia.sharebox.update.{}", unsafe {
+        libc::geteuid()
+    });
+    let existing = bounded_output(
+        "launchctl",
+        &[
+            "print",
+            &format!("gui/{}/{}", unsafe { libc::geteuid() }, label),
+        ],
+    )?;
+    if existing.status.success() {
+        if String::from_utf8_lossy(&existing.stdout)
+            .lines()
+            .any(|l| l.trim() == "state = running")
+        {
+            return Err("An updater is already running".into());
+        }
+        command("launchctl", &["remove", &label])?;
+    }
+    command(
+        "launchctl",
+        &[
+            "submit",
+            "-l",
+            &label,
+            "--",
+            &path_text(helper)?,
+            "update",
+            "--apply",
+            &path_text(plan)?,
+        ],
+    )
+}
+#[cfg(target_os = "macos")]
+pub fn cleanup_update_helper() -> Result<()> {
+    // launchctl's transient submit job disappears when removed; removing a live job
+    // also kills it, so leave its inert registration until the next update launch.
+    Ok(())
+}
+#[cfg(windows)]
+pub fn launch_update_helper(helper: &Path, plan: &Path) -> Result<()> {
+    let invocation = format!(
+        "& {} update --apply {}",
+        ps(&path_text(helper)?),
+        ps(&path_text(plan)?)
+    );
+    let args = format!(
+        "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command {}",
+        windows_arg(&invocation)
+    );
+    let script=format!("$ErrorActionPreference='Stop'; $id=[Security.Principal.WindowsIdentity]::GetCurrent(); $name='Sharebox-update-'+$id.User.Value; if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {{ throw 'An update task already exists' }}; $action=New-ScheduledTaskAction -Execute {} -Argument {}; $principal=New-ScheduledTaskPrincipal -UserId $id.Name -LogonType Interactive -RunLevel Limited; $settings=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -Settings $settings | Out-Null; try {{ Start-ScheduledTask -TaskName $name }} catch {{ Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue; throw }};",ps("powershell.exe"),ps(&args));
+    command(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ],
+    )
+}
+#[cfg(windows)]
+pub fn cleanup_update_helper() -> Result<()> {
+    let helper = std::env::current_exe().map_err(|e| e.to_string())?;
+    let needle = format!("& {} ", ps(&path_text(&helper)?));
+    let plain = helper
+        .to_string_lossy()
+        .trim_start_matches("\\\\?\\")
+        .to_owned();
+    let other = format!("& {} ", ps(&plain));
+    let script=format!("$ErrorActionPreference='Stop'; $name='Sharebox-update-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $t) {{ $a=@($t.Actions); if ($a.Count -eq 1 -and ($a[0].Arguments.Contains({}) -or $a[0].Arguments.Contains({}))) {{ Unregister-ScheduledTask -TaskName $name -Confirm:$false }} }}",ps(&needle),ps(&other));
+    command(
+        "powershell.exe",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ],
+    )
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub fn update_launcher_test_available() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let domain = format!("gui/{}", unsafe { libc::geteuid() });
+        if !bounded_output("launchctl", &["print", &domain])?
+            .status
+            .success()
+        {
+            return Ok(false);
+        }
+        let label = format!("{domain}/org.ossmalaysia.sharebox.update.{}", unsafe {
+            libc::geteuid()
+        });
+        Ok(!bounded_output("launchctl", &["print", &label])?
+            .status
+            .success())
+    }
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").map_err(|_| "USERNAME is missing")?;
+        if !bounded_output("quser.exe", &[&user])?.status.success() {
+            return Ok(false);
+        }
+        Ok(!registered("update")?)
+    }
+}
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub fn cleanup_launcher_test(helper: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let label = format!("org.ossmalaysia.sharebox.update.{}", unsafe {
+            libc::geteuid()
+        });
+        let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, label);
+        let out = bounded_output("launchctl", &["print", &target])?;
+        if out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains(&path_text(helper)?)
+        {
+            command("launchctl", &["remove", &label])?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let needle = format!("& {} ", ps(&path_text(helper)?));
+        let script=format!("$ErrorActionPreference='Stop'; $name='Sharebox-update-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $t -and @($t.Actions).Count -eq 1 -and $t.Actions[0].Arguments.Contains({})) {{ Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue }}; $remaining=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; if ($null -ne $remaining -and @($remaining.Actions).Count -eq 1 -and $remaining.Actions[0].Arguments.Contains({})) {{ throw 'Updater test registration was not removed' }}; exit 0",ps(&needle),ps(&needle));
+        command(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ],
+        )
+    }
 }
 
 #[cfg(test)]

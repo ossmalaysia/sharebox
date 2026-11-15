@@ -54,23 +54,52 @@ Published targets are Linux x86_64 (GNU libc), macOS Apple Silicon and Intel, an
 
 ## Update
 
-Stop Sharebox before replacing its executable (Ctrl+C for a foreground process, or `sharebox service stop master` / `sharebox service stop worker` for an installed background service). Run the same installer again to download the latest published release and verify its checksum. Keep your existing data directory and worker configuration; reinstalling the binary does not migrate or delete them.
+Starting with v0.5.0, the Windows system tray and macOS menu bar include **Check for updates**. The icon also checks the official GitHub release at startup and every six hours. A newer stable release prompts you to install; declining leaves Sharebox running. Finish or cancel active tests before accepting the update, because replacing the shared executable can interrupt both master and worker roles on that machine.
 
-Windows PowerShell:
+The updater downloads the matching native archive, verifies its SHA-256 against the release manifest, and prepares the replacement before stopping Sharebox. A separate helper closes the services and tray icons using that executable, replaces it, and restores their previous running state. Existing service registrations, master data paths, worker configuration, pairing, and task permissions are preserved. A stopped service is not enabled just because an update is installed. If replacement or service startup fails, the helper attempts to restore the previous executable and running services. The tray displays the result; a bounded diagnostic is also saved as `.sharebox-update-result` beside the executable. Updating one machine does not update its peers.
+
+Use `sharebox update --check` for a read-only release check from a terminal.
+
+The updater requires a writable installation directory and Internet access to GitHub. It does not request administrator privileges or accept a custom update server. Update checks do not upload project files, configuration, or credentials. See [SECURITY.md](SECURITY.md) for the release trust boundary.
+
+### First upgrade from v0.4.x or earlier
+
+Older binaries do not contain the updater, so install the new version once using the commands below. Keep the same installation directory, master data directory, and worker configuration. Wait for active tests to finish first.
+
+Windows master, in PowerShell:
 
 ```powershell
+$sb = "$env:LOCALAPPDATA\Sharebox\bin\sharebox.exe"
+& $sb service stop master
+# The tray also holds the executable open on Windows.
+Get-Process sharebox -ErrorAction SilentlyContinue |
+  Where-Object { $_.Path -eq $sb } |
+  Stop-Process -Force
 & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing 'https://raw.githubusercontent.com/ossmalaysia/sharebox/main/scripts/install.ps1').Content))
-& "$env:LOCALAPPDATA\Sharebox\bin\sharebox.exe" --version
+& $sb --version
+& $sb service start master
 ```
 
-macOS / Linux:
+Use `worker` instead of `master` for a Windows worker. If both roles run from this executable, stop both before updating and start both afterward.
+
+Mac worker, in Terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ossmalaysia/sharebox/main/scripts/install.sh | sh
-"$HOME/.local/bin/sharebox" --version
+(
+  set -e
+  sb="$HOME/.local/bin/sharebox"
+  "$sb" service stop worker
+  tray="gui/$(id -u)/org.ossmalaysia.sharebox.tray.worker"
+  if launchctl print "$tray" >/dev/null 2>&1; then
+    launchctl bootout "$tray"
+  fi
+  curl -fsSL https://raw.githubusercontent.com/ossmalaysia/sharebox/main/scripts/install.sh | sh
+  "$sb" --version
+  "$sb" service start worker
+)
 ```
 
-Use the same custom installation directory if you originally supplied one. After updating, restart the same master/worker command with the same data/config path, or use `sharebox service start master` / `sharebox service start worker`. Service commands require v0.2.0 or later.
+Use `master` in both the service command and tray label for a Mac master. Linux has no native tray; stop the service, rerun the shell installer, and restart it with `sharebox service start master` or `sharebox service start worker`. For foreground instances, stop them with Ctrl+C and restart the original command with the same data/configuration path. Use the same custom installation directory if you originally supplied one.
 
 ## Build
 

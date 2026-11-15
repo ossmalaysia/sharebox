@@ -107,10 +107,13 @@ mod native {
         Stop,
         Refresh,
         Open,
+        CheckUpdates,
     }
     struct Update {
         running: Option<bool>,
         message: String,
+        update_message: String,
+        installing: bool,
     }
 
     fn singleton(role: &str) -> Result<File> {
@@ -188,7 +191,76 @@ mod native {
         updates: SyncSender<Update>,
     ) {
         let mut next_action = Some(Action::Refresh);
+        let mut next_check = Instant::now();
+        let _ = crate::updater::cleanup_completed();
+        let mut last_result = crate::updater::last_result();
+        let mut update_message = last_result
+            .clone()
+            .unwrap_or_else(|| format!("Version {}", env!("CARGO_PKG_VERSION")));
+        let mut notified = String::new();
+        let mut installing = false;
+        let mut install_started: Option<Instant> = None;
         loop {
+            let result = crate::updater::last_result();
+            if result != last_result {
+                if let Some(message) = &result {
+                    update_message = message.clone();
+                    installing = false;
+                    install_started = None;
+                    let _ = crate::updater::cleanup_completed();
+                }
+                last_result = result;
+            }
+            if install_started.is_some_and(|started| started.elapsed() >= Duration::from_secs(600))
+            {
+                installing = false;
+                install_started = None;
+                update_message = "Update did not report completion — inspect .sharebox-update-result beside the executable".into();
+            }
+            let manual_check = matches!(next_action, Some(Action::CheckUpdates));
+            if !installing && (manual_check || Instant::now() >= next_check) {
+                next_check = Instant::now() + Duration::from_secs(6 * 60 * 60);
+                let _ = updates.try_send(Update {
+                    running: crate::service::is_running(&role).ok(),
+                    message: "Checking for updates…".into(),
+                    update_message: update_message.clone(),
+                    installing: true,
+                });
+                match crate::updater::check_latest() {
+                    Ok(Some(release)) => {
+                        update_message = format!("Update available: {}", release.tag);
+                        if manual_check || notified != release.tag {
+                            notified = release.tag.clone();
+                            match confirm_update(&release.tag) {
+                                Ok(true) => match crate::updater::install(&release) {
+                                    Ok(()) => {
+                                        installing = true;
+                                        install_started = Some(Instant::now());
+                                        update_message = "Installing update and restarting…".into();
+                                    }
+                                    Err(error) => {
+                                        eprintln!("Sharebox update: {error}");
+                                        update_message = format!("Update failed: {error}");
+                                    }
+                                },
+                                Ok(false) => {}
+                                Err(error) => {
+                                    eprintln!("Sharebox update prompt: {error}");
+                                    update_message =
+                                        "Update available — click Check for updates".into();
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        update_message = format!("Up to date ({})", env!("CARGO_PKG_VERSION"))
+                    }
+                    Err(error) => {
+                        eprintln!("Sharebox update check: {error}");
+                        update_message = "Update check failed — click to retry".into();
+                    }
+                }
+            }
             let action_result = match next_action.take() {
                 Some(Action::Start) => crate::service::service_action("start", &role),
                 Some(Action::Stop) => crate::service::service_action("stop", &role),
@@ -205,9 +277,12 @@ mod native {
                 (Ok(()), Ok(false)) => (Some(false), "Service stopped or not installed".into()),
                 (Ok(()), Err(_)) => (None, "Service status unavailable".into()),
             };
-            if let Err(mpsc::TrySendError::Disconnected(_)) =
-                updates.try_send(Update { running, message })
-            {
+            if let Err(mpsc::TrySendError::Disconnected(_)) = updates.try_send(Update {
+                running,
+                message,
+                update_message: update_message.clone(),
+                installing,
+            }) {
                 break;
             }
             match requests.recv_timeout(Duration::from_secs(if cfg!(windows) { 15 } else { 5 })) {
@@ -216,6 +291,42 @@ mod native {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn confirm_update(tag: &str) -> Result<bool> {
+        let message = update_prompt(tag);
+        let output = Command::new("/usr/bin/osascript")
+            .args(["-e", "on run argv", "-e", "display dialog (item 1 of argv) with title \"Sharebox update\" buttons {\"Later\", \"Update and restart\"} default button \"Later\" giving up after 120", "-e", "end run", "--", &message])
+            .stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("button returned:Update and restart"))
+    }
+
+    #[cfg(windows)]
+    fn confirm_update(tag: &str) -> Result<bool> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_YESNO,
+        };
+        let message: Vec<u16> = update_prompt(tag).encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "Sharebox update".encode_utf16().chain(Some(0)).collect();
+        let result = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2,
+            )
+        };
+        if result == 0 {
+            return Err("Could not display update prompt".into());
+        }
+        Ok(result == IDYES)
+    }
+
+    fn update_prompt(tag: &str) -> String {
+        format!("Sharebox {tag} is available. Download, verify, and restart with your existing configuration and pairing?\n\nFinish or cancel active tests first. This restarts running master and worker services using this installation. Other machines must be updated separately.")
     }
 
     #[cfg(target_os = "macos")]
@@ -305,10 +416,8 @@ mod native {
     #[cfg(windows)]
     impl EventLoop {
         fn new() -> Result<Self> {
-            // Detach only this process, never hide the user's terminal window.
-            unsafe {
-                windows_sys::Win32::System::Console::FreeConsole();
-            }
+            // Scheduled Tasks already launch a hidden host. Stay attached so
+            // stopping that task also terminates this companion and releases its lock.
             Ok(Self)
         }
         fn pump(&self) -> bool {
@@ -356,6 +465,12 @@ mod native {
         let start = MenuItem::new("Start service", false, None);
         let stop = MenuItem::new("Stop service (cancel jobs first)", false, None);
         let refresh = MenuItem::new("Refresh status", !options.check, None);
+        let update_status = MenuItem::new(
+            format!("Version {}", env!("CARGO_PKG_VERSION")),
+            false,
+            None,
+        );
+        let check_updates = MenuItem::new("Check for updates…", !options.check, None);
         let quit = MenuItem::new("Quit icon (keep service running)", true, None);
         menu.append_items(&[
             &heading,
@@ -365,6 +480,9 @@ mod native {
             &start,
             &stop,
             &refresh,
+            &PredefinedMenuItem::separator(),
+            &update_status,
+            &check_updates,
             &PredefinedMenuItem::separator(),
             &quit,
         ])
@@ -393,8 +511,10 @@ mod native {
             }
             while let Ok(update) = responses.try_recv() {
                 status.set_text(&update.message);
-                start.set_enabled(update.running == Some(false));
-                stop.set_enabled(update.running == Some(true));
+                start.set_enabled(!update.installing && update.running == Some(false));
+                stop.set_enabled(!update.installing && update.running == Some(true));
+                check_updates.set_enabled(!update.installing);
+                update_status.set_text(update.update_message.chars().take(150).collect::<String>());
                 let _ = icon.set_tooltip(Some(format!(
                     "Sharebox {} — {}",
                     options.role, update.message
@@ -416,6 +536,8 @@ mod native {
                     Action::Stop
                 } else if event.id == *open.id() {
                     Action::Open
+                } else if event.id == *check_updates.id() {
+                    Action::CheckUpdates
                 } else if event.id == *refresh.id() {
                     Action::Refresh
                 } else {
