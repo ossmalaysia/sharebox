@@ -114,6 +114,35 @@ def main():
             with urllib.request.urlopen(request, timeout=3) as response:
                 assert json.load(response)["name"] == "Local workspace"
 
+        def diagnose():
+            status = command([str(target), "service", "status", "master"])
+            print("Updater service diagnostics:", status.stdout, status.stderr, flush=True)
+            if system == "Windows":
+                script = (
+                    "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; "
+                    "foreach ($role in @('master','tray-master')) { "
+                    "$name='Sharebox-'+$role+'-'+$sid; "
+                    "Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Select-Object TaskName,State,Actions | Format-List; "
+                    "Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue | Select-Object LastRunTime,LastTaskResult | Format-List }; "
+                    "Get-CimInstance Win32_Process -Filter \"Name='sharebox.exe'\" | Select-Object ProcessId,ParentProcessId,ExecutablePath | Format-List"
+                )
+                state = command(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script])
+                print(state.stdout, state.stderr, flush=True)
+            else:
+                state = command(["launchctl", "print", f"gui/{os.getuid()}/org.ossmalaysia.sharebox.tray.master"])
+                print(state.stdout, state.stderr, flush=True)
+            # A foreground attempt exposes startup errors hidden by the login task.
+            # It only opens an icon, uses no credentials, and is always terminated.
+            if not tray_running(system):
+                probe = subprocess.Popen([str(target), "tray", "--role", "master", "--dashboard", origin], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    out, err = probe.communicate(timeout=4)
+                    print("Direct tray probe exited:", probe.returncode, out, err, flush=True)
+                except subprocess.TimeoutExpired:
+                    probe.terminate()
+                    out, err = probe.communicate(timeout=10)
+                    print("Direct tray probe stayed running until terminated:", out, err, flush=True)
+
         attempted = False
         try:
             attempted = True
@@ -136,6 +165,12 @@ def main():
                 if bad_candidate:
                     assert "rollback" in result.stderr.lower(), result.stderr
             print("PASS: native helper replaces executable, restarts service/tray, preserves credentials, rolls back failed startup")
+        except Exception:
+            try:
+                diagnose()
+            except Exception as diagnostic_error:
+                print("Updater diagnostics failed:", diagnostic_error, flush=True)
+            raise
         finally:
             if attempted:
                 cleanup = command([str(target), "service", "uninstall", "master"])
