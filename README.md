@@ -336,7 +336,7 @@ The LLM can discover available workers and permitted tasks, submit jobs, inspect
 
 ## Validation scope
 
-The current development environment blocks loopback socket binding, so an end-to-end local network run has not been verified there. Unit/build checks do not establish a working two-computer setup. The CI workflow runs real master/worker/MCP integration checks on Linux, macOS, and Windows; consult the workflow result for the commit or release you use.
+Local validation covers real master/worker/MCP communication, registration through the setup page, and execution of uploaded project snapshots using native Node/npm and Docker. These tests use disposable local instances; they do not establish firewall reachability between your computers. The CI workflow runs integration checks on Linux, macOS, and Windows; consult the workflow result for the commit or release you use.
 
 To exercise the full flow on a machine that permits local listeners:
 
