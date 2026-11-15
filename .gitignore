@@ -17,3 +17,8 @@
 # Snapshot workspaces and the documented paired-worker config.
 /.sharebox-snapshots/
 /sharebox-worker.json
+
+# Local worker setup sessions and process locks
+*.setup-session.json
+*.setup.lock
+*.worker.lock

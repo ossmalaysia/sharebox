@@ -18,6 +18,7 @@
     </div>
     <div class="login-form-wrap"><form id="login-form" class="login-form"><span class="eyebrow">Welcome to your workspace</span><h2 id="login-title">Connect to the master</h2><p>Enter the admin token printed in the terminal when your Sharebox master started.</p><label for="admin-token">Master admin token</label><input id="admin-token" name="token" type="password" required autocomplete="off" spellcheck="false" placeholder="Paste your admin token"><p class="input-help">Kept in this tab’s session storage. Never placed in a URL.</p><div id="login-error" class="alert hidden" role="alert"></div><button type="submit" class="btn primary full">Open workspace <span>→</span></button><div class="login-note"><strong>Native execution, explicit access.</strong><p>Workers run tasks you configure in their local checkout. Uploaded snapshots require an explicitly enabled task.</p></div></form></div>
   </section>
+  <section id="registration" class="registration hidden" aria-labelledby="registration-title"><div class="brand"><span class="logo">▧</span>sharebox<span class="brand-dot">.</span></div><div class="panel registration-panel" id="registration-content"></div><a class="text-btn" href="/">Open master dashboard instead</a></section>
   <div id="app" class="app hidden">
     <aside>
       <a class="brand" href="#overview" aria-label="Sharebox overview"><span class="logo">▧</span>sharebox<span class="brand-dot">.</span></a>
@@ -25,7 +26,7 @@
       <nav aria-label="Main navigation"><a class="active" href="#overview"><span>◫</span>Overview</a><a href="#workers"><span>▣</span>Workers</a><a href="#jobs"><span>≋</span>Jobs & logs</a><a href="#connections"><span>⌘</span>MCP connections</a></nav>
       <div class="sidefoot"><span class="dot"></span>Powered by your computers<br><span id="connection-caption">Local master connected</span><button id="logout" class="text-btn">Disconnect this browser ↗</button></div>
     </aside>
-    <div class="main"><header><div class="breadcrumb">Your network <span>/</span><strong id="breadcrumb">Overview</strong></div><div class="header-status"><span class="pill"><span id="connection-dot" class="dot"></span><span id="connection-state">Connected</span></span><span class="version">Local preview</span></div></header>
+    <div class="main"><header><div class="breadcrumb">Your network <span>/</span><strong id="breadcrumb">Overview</strong></div><div class="header-status"><span class="pill"><span id="connection-dot" class="dot"></span><span id="connection-state">Connected</span></span><span class="version" id="master-version">Checking version…</span></div></header>
       <main id="overview">
         <div id="page-error" class="alert hidden" role="alert"></div>
         <div class="heading"><div><span class="eyebrow">Your distributed workspace</span><h1>More machines. One agent.</h1><p>Delegate approved tasks to the devices on your network.</p></div><div class="actions"><button class="btn" data-action="connect-mcp">Connect MCP ↗</button><button class="btn primary" data-action="new-job">+ Delegate task</button></div></div>

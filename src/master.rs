@@ -429,6 +429,43 @@ fn worker_snapshot(store: &mut Store, worker_id: &str, req: &Request) -> Respons
         _ => Response::error(404, "Worker snapshot endpoint not found"),
     }
 }
+fn worker_capabilities(value: &Value) -> Result<Option<Value>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let version = value["version"].as_str().ok_or("Worker version required")?;
+    if version.is_empty()
+        || version.len() > 32
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-+".contains(&b))
+    {
+        return Err("Invalid worker version".into());
+    }
+    let docker = &value["docker"];
+    let available = docker["available"]
+        .as_bool()
+        .ok_or("Docker availability must be boolean")?;
+    let checked = docker
+        .get("checked")
+        .map(|v| v.as_bool().ok_or("Docker check status must be boolean"))
+        .transpose()?
+        .unwrap_or(true);
+    let ready = docker["ready"]
+        .as_bool()
+        .ok_or("Docker readiness must be boolean")?;
+    let message = docker["message"].as_str().unwrap_or("");
+    if message.len() > 500
+        || message.chars().any(char::is_control)
+        || (ready && (!available || !checked))
+    {
+        return Err("Invalid Docker capability report".into());
+    }
+    Ok(Some(
+        json!({"version":version,"docker":{"available":available,"ready":ready,"checked":checked,"message":message}}),
+    ))
+}
+
 fn worker_api(store: &mut Store, worker_id: &str, req: &Request, b: &Value) -> Response {
     if req.method == "GET" && req.path.starts_with("/api/worker/jobs/") {
         return worker_snapshot(store, worker_id, req);
@@ -436,7 +473,27 @@ fn worker_api(store: &mut Store, worker_id: &str, req: &Request, b: &Value) -> R
     if req.method != "POST" {
         return Response::error(405, "POST required");
     }
+    if req.path == "/api/worker/status" {
+        let worker = store
+            .state
+            .workers
+            .iter()
+            .find(|w| w["id"] == worker_id)
+            .unwrap();
+        let running = store.state.jobs.iter().find(|j| {
+            j["workerId"] == worker_id
+                && matches!(j["status"].as_str(), Some("running" | "cancelling"))
+        });
+        return Response::json(
+            200,
+            json!({"workerId":worker_id,"name":worker["name"],"lastSeen":worker["lastSeen"],"lastPollAt":worker["lastPollAt"],"tasks":worker["tasks"],"runningJobId":running.map(|j| &j["id"]),"masterVersion":env!("CARGO_PKG_VERSION")}),
+        );
+    }
     if req.path == "/api/worker/poll" {
+        let capabilities = match worker_capabilities(&b["capabilities"]) {
+            Ok(value) => value,
+            Err(error) => return Response::error(400, &error),
+        };
         let refreshed = if b.get("tasks").is_some() {
             match tasks(&b["tasks"]) {
                 Ok(t) => Some(t),
@@ -452,6 +509,10 @@ fn worker_api(store: &mut Store, worker_id: &str, req: &Request, b: &Value) -> R
             .find(|w| w["id"] == worker_id)
             .unwrap();
         w["lastSeen"] = json!(now());
+        w["lastPollAt"] = w["lastSeen"].clone();
+        if let Some(capabilities) = capabilities {
+            w["capabilities"] = capabilities;
+        }
         if let Some(t) = refreshed {
             w["tasks"] = t;
         }
@@ -736,6 +797,10 @@ fn handle(store: &mut Store, req: &Request) -> Response {
             Ok(t) => t,
             Err(e) => return Response::error(400, &e),
         };
+        let capabilities = match worker_capabilities(&body["capabilities"]) {
+            Ok(value) => value,
+            Err(error) => return Response::error(400, &error),
+        };
         let name = body["name"].as_str().unwrap_or("Worker");
         if name.len() > 100 {
             return Response::error(400, "Worker name too long");
@@ -746,7 +811,7 @@ fn handle(store: &mut Store, req: &Request) -> Response {
         store.state.pairings.remove(i);
         let token = random();
         let id = format!("worker-{}", &random()[..16]);
-        store.state.workers.push(json!({"id":id,"name":name,"os":body["os"],"arch":body["arch"],"tasks":t,"token":token,"lastSeen":now(),"revoked":false}));
+        store.state.workers.push(json!({"id":id,"name":name,"os":body["os"],"arch":body["arch"],"tasks":t,"capabilities":capabilities,"token":token,"lastSeen":now(),"lastPollAt":0,"revoked":false}));
         return Response::json(201, json!({"token":token,"workerId":id}));
     }
     if role == Role::None {
@@ -770,7 +835,10 @@ fn handle(store: &mut Store, req: &Request) -> Response {
         ("GET", "/api/network") => {
             Response::json(200, json!(crate::network::snapshot(store.bound_addr)))
         }
-        ("GET", "/api/me") => Response::json(200, json!({"name":"Local workspace"})),
+        ("GET", "/api/me") => Response::json(
+            200,
+            json!({"name":"Local workspace","version":env!("CARGO_PKG_VERSION")}),
+        ),
         ("GET", "/api/workspace") => Response::json(
             200,
             json!({"workers":store.state.workers.iter().map(clean).collect::<Vec<_>>(),"jobs":store.state.jobs.iter().rev().map(|j|{let mut out=clean(j);out.as_object_mut().unwrap().remove("log");out}).collect::<Vec<_>>(),"tokens":store.state.tokens.iter().map(clean).collect::<Vec<_>>()}),
@@ -1246,6 +1314,81 @@ mod tests {
             .insert("origin".into(), "http://evil.example".into());
         assert_eq!(handle(&mut store(), &r).status, 403);
     }
+    #[test]
+    fn status_is_authenticated_read_only_and_never_claims_jobs() {
+        let mut s = store();
+        s.state.workers.push(json!({"id":"w","token":"worker","name":"My worker","lastSeen":123,"lastPollAt":0,"tasks":[{"name":"test"}]}));
+        s.state
+            .jobs
+            .push(json!({"id":"queued","workerId":"w","task":"test","status":"queued"}));
+        let workers = s.state.workers.clone();
+        let jobs = s.state.jobs.clone();
+        let response = handle(
+            &mut s,
+            &req(
+                "POST",
+                "/api/worker/status",
+                "worker",
+                json!({"workerId":"someone-else"}),
+            ),
+        );
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["workerId"], "w");
+        assert!(body.get("token").is_none());
+        assert!(body["runningJobId"].is_null());
+        assert_eq!(s.state.workers, workers);
+        assert_eq!(s.state.jobs, jobs);
+        s.state.workers[0]["revoked"] = json!(true);
+        assert_eq!(
+            handle(
+                &mut s,
+                &req("POST", "/api/worker/status", "worker", json!({}))
+            )
+            .status,
+            401
+        );
+    }
+    #[test]
+    fn capabilities_are_bounded_sanitized_and_heartbeat_backwards_compatible() {
+        assert!(worker_capabilities(&Value::Null).unwrap().is_none());
+        let report = json!({"version":"0.6.0","docker":{"available":true,"ready":true,"message":"Docker ready","secret":"excluded"},"credentials":"excluded"});
+        let clean = worker_capabilities(&report).unwrap().unwrap();
+        assert!(clean.get("credentials").is_none());
+        assert!(clean["docker"].get("secret").is_none());
+        for invalid in [
+            json!({"version":"x","docker":{"available":false,"ready":true}}),
+            json!({"version":"x","docker":{"available":true,"ready":true,"message":"x".repeat(501)}}),
+        ] {
+            assert!(worker_capabilities(&invalid).is_err());
+        }
+        let mut s = store();
+        s.state.workers.push(json!({"id":"w","token":"worker","lastSeen":0,"lastPollAt":0,"tasks":[{"name":"test"}]}));
+        assert_eq!(
+            handle(
+                &mut s,
+                &req(
+                    "POST",
+                    "/api/worker/poll",
+                    "worker",
+                    json!({"capabilities":report})
+                )
+            )
+            .status,
+            200
+        );
+        assert_eq!(s.state.workers[0]["capabilities"], clean);
+        assert!(s.state.workers[0]["lastPollAt"].as_u64().unwrap() > 0);
+        assert_eq!(
+            handle(
+                &mut s,
+                &req("POST", "/api/worker/poll", "worker", json!({}))
+            )
+            .status,
+            200
+        );
+    }
+
     #[test]
     fn cancelled_queue_is_never_assigned() {
         let mut s = store();

@@ -108,6 +108,9 @@ pub fn excluded_path(path: &str) -> bool {
             || name.starts_with("id_ecdsa")
             || name.starts_with("id_ed25519")
             || name.ends_with(".credentials.json")
+            || name.ends_with(".setup-session.json")
+            || name.ends_with(".setup.lock")
+            || name.ends_with(".worker.lock")
             || [
                 ".pem",
                 ".key",
@@ -132,14 +135,21 @@ pub fn contains_worker_credentials(bytes: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return false;
     };
-    value["token"]
+    let paired = value["token"]
         .as_str()
         .is_some_and(|token| !token.is_empty())
         && value["server"]
             .as_str()
             .is_some_and(|server| !server.is_empty())
         && (value["workerId"].as_str().is_some_and(|id| !id.is_empty())
-            || value["tasks"].is_object())
+            || value["tasks"].is_object());
+    let setup_session = value["url"].as_str().is_some_and(|url| {
+        url.starts_with("http://127.0.0.1:")
+            && url.split_once("/#token=").is_some_and(|(_, token)| {
+                token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    });
+    paired || setup_session
 }
 
 /// Validate an untrusted slash-separated relative path without touching the disk.
@@ -371,10 +381,25 @@ mod tests {
         }
     }
     #[test]
+    fn local_setup_session_credentials_are_excluded_even_when_renamed() {
+        let session =
+            serde_json::json!({"url":format!("http://127.0.0.1:7000/#token={}","a".repeat(64))});
+        assert!(contains_worker_credentials(
+            &serde_json::to_vec(&session).unwrap()
+        ));
+        assert!(!contains_worker_credentials(
+            br#"{"url":"http://127.0.0.1:7000/"}"#
+        ));
+    }
+
+    #[test]
     fn mandatory_exclusions_apply_to_any_case_and_depth() {
         for path in [
             ".git/config",
             "sharebox-worker.json",
+            "renamed.json.setup-session.json",
+            "owner.json.setup.lock",
+            "owner.json.worker.lock",
             ".sharebox-snapshots/job/source/file.js",
             ".sharebox-uploads/a",
             ".sharebox-staging/a",

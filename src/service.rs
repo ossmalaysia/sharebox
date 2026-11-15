@@ -866,9 +866,253 @@ pub fn cleanup_launcher_test(helper: &Path) -> Result<()> {
     }
 }
 
+/// Read the configuration path from the owner's existing registration. Never
+/// guess a new path when a registration exists but cannot be understood.
+pub fn worker_registration_config() -> Result<Option<PathBuf>> {
+    #[cfg(target_os = "macos")]
+    {
+        let file = home()?.join("Library/LaunchAgents/org.ossmalaysia.sharebox.worker.plist");
+        if !file.exists() {
+            return Ok(None);
+        }
+        let output = bounded_output(
+            "/usr/bin/plutil",
+            &["-convert", "json", "-o", "-", &path_text(&file)?],
+        )?;
+        if !output.status.success() {
+            return Err("Cannot read worker service registration".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| "Invalid worker service registration")?;
+        let args = value["ProgramArguments"]
+            .as_array()
+            .ok_or("Worker service arguments missing")?;
+        let index = args
+            .iter()
+            .position(|a| a == "--config")
+            .ok_or("Worker service configuration path missing")?;
+        let path = args
+            .get(index + 1)
+            .and_then(|a| a.as_str())
+            .ok_or("Worker service configuration path missing")?;
+        checked_worker_config(path).map(Some)
+    }
+    #[cfg(windows)]
+    {
+        if !registered("worker")? {
+            return Ok(None);
+        }
+        let script = "$ErrorActionPreference='Stop'; $name='Sharebox-worker-'+[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $t=Get-ScheduledTask -TaskName $name; $a=@($t.Actions); if ($a.Count -ne 1) { throw 'Unexpected worker service actions' }; ConvertTo-Json -Compress -InputObject $a[0].Arguments";
+        let output = bounded_output(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+        )?;
+        if !output.status.success() {
+            return Err("Cannot read worker service registration".into());
+        }
+        let args: String = serde_json::from_slice(&output.stdout)
+            .map_err(|_| "Invalid worker service arguments")?;
+        config_from_powershell(&args)
+            .and_then(|p| checked_worker_config(&p))
+            .map(Some)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let directory = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or(home()?.join(".config"));
+        let file = directory.join("systemd/user/sharebox-worker.service");
+        if !file.exists() {
+            return Ok(None);
+        }
+        let mut text = String::new();
+        std::fs::File::open(file)
+            .map_err(|e| e.to_string())?
+            .take(16385)
+            .read_to_string(&mut text)
+            .map_err(|e| e.to_string())?;
+        if text.len() > 16384 {
+            return Err("Worker service registration too large".into());
+        }
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .ok_or("Worker service arguments missing")?;
+        config_from_systemd(line)
+            .and_then(|p| checked_worker_config(&p))
+            .map(Some)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    Err("Worker services are unsupported on this platform".into())
+}
+fn checked_worker_config(value: &str) -> Result<PathBuf> {
+    safe(value)?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("Registered worker configuration path must be absolute".into());
+    }
+    Ok(path)
+}
+#[cfg(any(windows, test))]
+fn config_from_powershell(args: &str) -> Result<String> {
+    let tail = args
+        .rsplit_once("'--config'")
+        .ok_or("Worker service configuration path missing")?
+        .1
+        .trim_start();
+    let mut chars = tail
+        .strip_prefix('\'')
+        .ok_or("Unsupported worker service configuration quoting")?
+        .chars()
+        .peekable();
+    let mut value = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                value.push('\'');
+            } else {
+                return Ok(value);
+            }
+        } else {
+            value.push(c);
+        }
+    }
+    Err("Unterminated worker service configuration path".into())
+}
+#[cfg(any(target_os = "linux", test))]
+fn config_from_systemd(args: &str) -> Result<String> {
+    let mut chars = args.chars().peekable();
+    let mut tokens = Vec::new();
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        if chars.next() != Some('"') {
+            return Err("Unsupported worker service arguments".into());
+        }
+        let mut token = String::new();
+        let mut closed = false;
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    closed = true;
+                    break;
+                }
+                '\\' => {
+                    let next = chars.next().ok_or("Invalid service escape")?;
+                    if !matches!(next, '\\' | '"') {
+                        return Err("Unsupported service escape".into());
+                    }
+                    token.push(next);
+                }
+                _ => token.push(c),
+            }
+        }
+        if !closed {
+            return Err("Unterminated worker service argument".into());
+        }
+        tokens.push(token.replace("%%", "%").replace("$$", "$"));
+    }
+    let i = tokens
+        .iter()
+        .position(|v| v == "--config")
+        .ok_or("Worker service configuration path missing")?;
+    tokens
+        .get(i + 1)
+        .cloned()
+        .ok_or("Worker service configuration path missing".into())
+}
+pub fn worker_registration_uses_current_executable() -> Result<bool> {
+    let target = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        update_registration_matches("worker", &target)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let directory = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or(home()?.join(".config"));
+        let mut text = String::new();
+        std::fs::File::open(directory.join("systemd/user/sharebox-worker.service"))
+            .map_err(|e| e.to_string())?
+            .take(16385)
+            .read_to_string(&mut text)
+            .map_err(|e| e.to_string())?;
+        if text.len() > 16384 {
+            return Err("Worker service registration too large".into());
+        }
+        let prefix = format!("ExecStart={} ", unit_quote(&path_text(&target)?, true));
+        Ok(text.lines().any(|line| line.starts_with(&prefix)))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = target;
+        Err("Worker services are unsupported on this platform".into())
+    }
+}
+
+pub fn worker_service_running() -> Result<bool> {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        is_running("worker")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", "sharebox-worker.service"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(3 | 4) => Ok(false),
+            _ => Err("Cannot inspect worker service status".into()),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        Err("Worker services are unsupported on this platform".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_reads_existing_config_paths_with_spaces_and_escapes() {
+        let source = sample();
+        let args = format!(
+            "& {} 'worker' '--config' {}",
+            ps(&source.exe),
+            ps(&source.args[2])
+        );
+        assert_eq!(config_from_powershell(&args).unwrap(), source.args[2]);
+        assert!(config_from_powershell("'--config' 'unfinished").is_err());
+        let unit = unit(&source);
+        let line = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .unwrap();
+        assert_eq!(config_from_systemd(line).unwrap(), source.args[2]);
+        assert!(config_from_systemd("unquoted --config /tmp/x").is_err());
+    }
     fn sample() -> Spec {
         Spec {
             role: "worker".into(),

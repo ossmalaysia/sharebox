@@ -143,6 +143,30 @@ Use the master's actual LAN address, for example `http://192.168.1.20:7331`. `0.
 
 ## Register and start a worker
 
+For guided setup, run this **on the worker machine**:
+
+```sh
+sharebox setup --config /absolute/path/to/worker.json
+```
+
+This opens a private setup page on `127.0.0.1`. On Windows, use `sharebox.exe` and a Windows configuration path. Keep the setup process running while using its page; `--no-open` prints the local address instead of opening a browser.
+
+1. In the master's dashboard, choose **Pair worker** and copy its one-time registration link. Select the master address reachable from the worker first.
+2. Paste the registration link into the worker's local setup page. Choose its name, workspace directory, and allowed test preset. Explicitly enable uploaded snapshot execution; source files do not arrive merely by pairing.
+3. Select native execution for trusted projects, or Docker sandbox execution when the page reports that the Docker daemon is ready. Select a locally available image, or explicitly download it using the image control. Docker availability alone does not enable a sandbox.
+4. Register the worker, then use the separate background-service control to install or start it. Pairing persists the credential but does not start polling or install a service automatically.
+5. Check the local worker/service status and the master's registered-worker list. A saved pairing, a running local process, and a recent master heartbeat are different signals; the master must be reachable for the worker to become online.
+
+If the master was recreated or the worker credential was revoked, stop the worker and select **Replace pairing** with a fresh registration link. A failed replacement keeps the old credentials; a successful replacement preserves custom tasks. Remove an unused old worker registration from its master separately.
+
+Finish or cancel active tests and stop the worker before changing its task settings. **Close setup** closes only the private setup page server; the worker service keeps running. Reopening setup reuses the active session for that configuration.
+
+The setup page owns only its `sharebox-tests` preset. It preserves other owner-defined tasks and existing pairing credentials; custom tasks are not automatically converted to sandboxed tasks. The master and MCP clients cannot edit the worker's local execution permissions. Existing manually configured tasks remain supported through the configuration file.
+
+Docker mode uses the same restricted snapshot container described below. Networking is disabled by default. Package installation or tests that need network access require an explicit worker-owner choice. A missing/unreachable Docker daemon is an error, never a reason to fall back to native execution. Browser end-to-end tests also require an image containing the appropriate browsers and dependencies.
+
+### Manual configuration
+
 Copy or build the executable on the target machine. Create a worker configuration:
 
 ```sh
@@ -312,7 +336,7 @@ The LLM can discover available workers and permitted tasks, submit jobs, inspect
 
 ## Validation scope
 
-The current development environment blocks loopback socket binding, so an end-to-end local network run has not been verified there. Unit/build checks do not establish a working two-computer setup. The CI workflow runs real master/worker/MCP integration checks on Linux, macOS, and Windows; consult the workflow result for the commit or release you use.
+Local validation covers real master/worker/MCP communication, registration through the setup page, and execution of uploaded project snapshots using native Node/npm and Docker. These tests use disposable local instances; they do not establish firewall reachability between your computers. The CI workflow runs integration checks on Linux, macOS, and Windows; consult the workflow result for the commit or release you use.
 
 To exercise the full flow on a machine that permits local listeners:
 

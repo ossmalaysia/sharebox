@@ -37,3 +37,11 @@ Installing an update requires an explicit local confirmation. The update is down
 The updater verifies the native archive against the same release's SHA-256 manifest before extracting the executable. HTTPS and checksums protect transport integrity and archive selection; they are not independent release signatures and do not protect against a compromised publisher account or release pipeline. The native binaries remain unsigned/unnotarized. Existing same-account code can already modify user-owned binaries and service configuration; the updater is not a privilege boundary against that account.
 
 The helper runs without elevation and preserves existing service registrations and data/configuration paths. Configuration and credentials are not part of the replacement payload. Keep backups of important master state independently of executable updates.
+
+## Local worker setup
+
+`sharebox setup` listens only on IPv4 loopback and uses a fresh bearer token for that setup session. Its page URL carries the session token in a fragment, so it is not part of the HTTP request path. Treat the local URL as private while the setup process is running. Setup API requests must use the expected Host; state-changing requests additionally require the exact local Origin. Request bodies are bounded. The API does not use ambient browser cookies and is not exposed by the LAN master or MCP endpoint.
+
+A registration link contains a short-lived, one-time pairing code, not an administrator or MCP token. It selects only the private-network master. The worker owner still chooses uploaded-code permission, a fixed task preset, workspace, container image, and network mode on the worker machine. Setup preserves other existing owner tasks; selecting Docker for its managed preset does not sandbox unrelated native tasks. Docker detection does not grant execution permission, and an unavailable Docker daemon never triggers native fallback.
+
+Image downloads and background service changes are separate explicit local actions. Docker daemon access grants significant capabilities to the local account; the setup UI is not a security boundary against other code already running as that same account. Pairing credentials remain in the private worker configuration and are not returned by the setup status API.
