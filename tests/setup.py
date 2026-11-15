@@ -131,7 +131,7 @@ def main():
             preset = config["tasks"]["sharebox-tests"]
             assert preset["argv"] == ["node", "--test"]
             assert preset["snapshot"]["mode"] == "native"
-            assert Path(preset["cwd"]).resolve() == workspace
+            assert Path(preset["cwd"]).samefile(workspace)
             private = config["token"]
             assert private not in json.dumps(result)
             local_status = local("/api/setup/status")
