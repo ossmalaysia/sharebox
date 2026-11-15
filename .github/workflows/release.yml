@@ -74,7 +74,7 @@ jobs:
           digest = hashlib.sha256(archive.read_bytes()).hexdigest()
           (out / (archive.name + '.sha256')).write_text(digest + '  ' + archive.name + '\n')
           PY
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: dist/*
